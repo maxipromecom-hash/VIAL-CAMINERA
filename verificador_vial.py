@@ -17,7 +17,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-VERSION = "4.0"
+VERSION = "5.0"
 URL_LOGIN = "https://sistemas.seguridad.mendoza.gov.ar/vialcaminera//servlet/com.ktksuitelr.mdlsgt.hlogin2"
 URL_CONSULTA_HINT = "wpconsultaantecedentes"
 
@@ -427,21 +427,76 @@ def click_tres_puntos(driver, acta_el):
     return False
 
 
-def esperar_info_objeto(driver, timeout=6):
+def _texto_contexto_actual(driver):
     try:
-        WebDriverWait(driver, timeout).until(
-            lambda d: "INFORMACION DE OBJETO" in norm(d.find_element(By.TAG_NAME, "body").text)
-        )
-        return True
+        return driver.find_element(By.TAG_NAME, "body").text or ""
     except Exception:
+        return ""
+
+
+def _buscar_contexto_con_texto(driver, frases, profundidad=0, max_profundidad=3):
+    """Busca texto visible en documento principal o iframes y deja activo el contexto encontrado."""
+    texto = norm(_texto_contexto_actual(driver))
+    if all(norm(f) in texto for f in frases if f):
+        return True
+
+    if profundidad >= max_profundidad:
         return False
+
+    try:
+        frames = driver.find_elements(By.CSS_SELECTOR, "iframe, frame")
+    except Exception:
+        frames = []
+
+    for fr in frames:
+        try:
+            if not visible(fr):
+                continue
+            driver.switch_to.frame(fr)
+            if _buscar_contexto_con_texto(driver, frases, profundidad + 1, max_profundidad):
+                return True
+            driver.switch_to.parent_frame()
+        except Exception:
+            try:
+                driver.switch_to.parent_frame()
+            except Exception:
+                pass
+    return False
+
+
+def _activar_contexto_info_objeto(driver):
+    """Ubica el popup de Información de Objeto, incluso cuando GeneXus lo abre dentro de un iframe."""
+    try:
+        driver.switch_to.default_content()
+    except Exception:
+        pass
+
+    # La captura del sistema muestra ambos textos; cualquiera de ellos identifica el popup.
+    for frases in (["INFORMACION DE OBJETO"], ["ADMINISTRACION DE OBJETOS"], ["DATOS DESCRIPTIVOS", "INFRACCIONES"]):
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+        if _buscar_contexto_con_texto(driver, frases):
+            return True
+    return False
+
+
+def esperar_info_objeto(driver, timeout=10):
+    fin = time.time() + timeout
+    while time.time() < fin:
+        if _activar_contexto_info_objeto(driver):
+            return True
+        time.sleep(0.25)
+    return False
 
 
 def click_lupa(driver):
     """Dentro de Información de Objeto, abre Objetos Datos Descriptivos."""
-    body_norm = norm(driver.find_element(By.TAG_NAME, "body").text)
-    if "INFORMACION DE OBJETO" not in body_norm:
+    # Asegurar que estamos dentro del documento/iframe donde vive el popup.
+    if not _activar_contexto_info_objeto(driver):
         return False
+    body_norm = norm(_texto_contexto_actual(driver))
 
     # 1. Imágenes/enlaces cuyo nombre sugiera búsqueda/lupa/detalle.
     elems = driver.find_elements(By.XPATH, "//*[self::img or self::a or self::button]")
@@ -503,19 +558,23 @@ def click_lupa(driver):
     return False
 
 
-def esperar_datos_descriptivos(driver, acta, timeout=7):
-    try:
-        WebDriverWait(driver, timeout).until(
-            lambda d: (
-                "OBJETOS DATOS DESCRIPTIVOS" in norm(d.find_element(By.TAG_NAME, "body").text)
-                and compact(acta) in compact(d.find_element(By.TAG_NAME, "body").text)
-                and "TIPO VEHICULO" in norm(d.find_element(By.TAG_NAME, "body").text)
-                and "DOMINIO" in norm(d.find_element(By.TAG_NAME, "body").text)
-            )
-        )
-        return driver.find_element(By.TAG_NAME, "body").text
-    except Exception:
-        return None
+def esperar_datos_descriptivos(driver, acta, timeout=10):
+    """Espera la ventana final y la localiza aunque aparezca en otro iframe."""
+    fin = time.time() + timeout
+    while time.time() < fin:
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+
+        encontrado = _buscar_contexto_con_texto(driver, ["OBJETOS DATOS DESCRIPTIVOS"])
+        if encontrado:
+            texto = _texto_contexto_actual(driver)
+            nt = norm(texto)
+            if compact(acta) in compact(texto) and "TIPO VEHICULO" in nt and "DOMINIO" in nt:
+                return texto
+        time.sleep(0.25)
+    return None
 
 
 def extraer_campo(texto, etiqueta, siguientes):
@@ -755,12 +814,14 @@ class App:
 
         if not click_tres_puntos(self.driver, acta_el):
             return None, "NO SE PUDO ABRIR LOS TRES PUNTOS"
-        if not esperar_info_objeto(self.driver, timeout=6):
-            return None, "NO SE ABRIO INFORMACION DE OBJETO"
+        if not esperar_info_objeto(self.driver, timeout=10):
+            return None, "NO SE DETECTO INFORMACION DE OBJETO"
+        self.log("  -> INFORMACION DE OBJETO detectada")
 
         if not click_lupa(self.driver):
             return None, "NO SE PUDO ABRIR LA LUPA"
-        texto = esperar_datos_descriptivos(self.driver, acta, timeout=7)
+        self.log("  -> Lupa abierta; esperando DATOS DESCRIPTIVOS")
+        texto = esperar_datos_descriptivos(self.driver, acta, timeout=10)
         if not texto:
             return None, "NO SE ABRIO DATOS DESCRIPTIVOS"
         return extraer_datos(texto), None
@@ -881,3 +942,4 @@ if __name__ == "__main__":
     root = tk.Tk()
     App(root)
     root.mainloop()
+
