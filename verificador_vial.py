@@ -14,10 +14,11 @@ from openpyxl import load_workbook
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-VERSION = "5.0"
+VERSION = "6.0"
 URL_LOGIN = "https://sistemas.seguridad.mendoza.gov.ar/vialcaminera//servlet/com.ktksuitelr.mdlsgt.hlogin2"
 URL_CONSULTA_HINT = "wpconsultaantecedentes"
 
@@ -491,72 +492,159 @@ def esperar_info_objeto(driver, timeout=10):
     return False
 
 
-def click_lupa(driver):
-    """Dentro de Información de Objeto, abre Objetos Datos Descriptivos."""
-    # Asegurar que estamos dentro del documento/iframe donde vive el popup.
-    if not _activar_contexto_info_objeto(driver):
-        return False
-    body_norm = norm(_texto_contexto_actual(driver))
+def click_lupa(driver, acta=None, log=None):
+    """Abre Objetos Datos Descriptivos y confirma que la ventana realmente apareció.
 
-    # 1. Imágenes/enlaces cuyo nombre sugiera búsqueda/lupa/detalle.
-    elems = driver.find_elements(By.XPATH, "//*[self::img or self::a or self::button]")
-    candidatos = []
-    for raw in elems:
-        e = clickable_from_element(raw)
+    v6: el ícono amarillo de lupa del sistema GeneXus no siempre expone href/onclick
+    en el IMG. Por eso se localiza la fila de datos y se prueban tanto el control
+    real como puntos físicos dentro de la primera celda (donde está la lupa).
+    """
+    def _log(msg):
+        if log:
+            try:
+                log(msg)
+            except Exception:
+                pass
+
+    def _probar_y_confirmar(el, descripcion):
         try:
-            if not visible(e) or not e.is_enabled():
-                continue
-            meta = norm(" ".join([
-                e.text or "", e.get_attribute("title") or "", e.get_attribute("alt") or "",
-                e.get_attribute("aria-label") or "", e.get_attribute("src") or "",
-                e.get_attribute("class") or ""
-            ]))
-            r = e.rect
-            candidatos.append((e, meta, r.get("x", 0), r.get("y", 0)))
+            driver.execute_script("arguments[0].scrollIntoView({block:'center',inline:'center'});", el)
+            time.sleep(0.15)
+            # click nativo primero; si GeneXus sólo escucha eventos del mouse, usar MouseEvent.
+            try:
+                el.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", el)
+            if acta:
+                texto = esperar_datos_descriptivos(driver, acta, timeout=2.2)
+                if texto:
+                    _log(f"  -> DATOS DESCRIPTIVOS abiertos ({descripcion})")
+                    return texto
+            else:
+                return True
         except Exception:
             pass
-    for palabra in ("LUPA", "SEARCH", "CONSULT", "DETALLE", "DESCRIPT"):
-        for e, meta, _, _ in candidatos:
-            if palabra in meta and "CERR" not in meta:
-                driver.execute_script("arguments[0].click();", e)
-                return True
+        return None
 
-    # 2. Buscar la tabla que tiene los encabezados Modelo / Marca / Color y tomar
-    # el primer control clickeable de la primera fila de datos.
+    # Asegurar contexto del popup Información de Objeto.
+    if not _activar_contexto_info_objeto(driver):
+        return None if acta else False
+
+    # 1) Localizar la tabla de Modelo / Marca / Color y su primera fila de datos.
+    filas = []
     try:
-        headers = driver.find_elements(By.XPATH, "//*[normalize-space(text())='Modelo' or normalize-space(text())='Marca']")
+        headers = driver.find_elements(
+            By.XPATH,
+            "//*[normalize-space(text())='Modelo' or normalize-space(text())='Marca' or normalize-space(text())='Color']"
+        )
         for h in headers:
             if not visible(h):
                 continue
             tables = h.find_elements(By.XPATH, "./ancestor::table[1]")
-            if not tables:
-                continue
-            table = tables[0]
-            rows = table.find_elements(By.XPATH, ".//tr")
-            for row in rows[1:]:
-                if not visible(row):
-                    continue
-                controls = row.find_elements(By.XPATH, ".//*[self::a or self::button or self::img or self::input]")
-                controls = [clickable_from_element(c) for c in controls]
-                controls = [c for c in controls if visible(c)]
-                if controls:
-                    controls.sort(key=lambda c: c.rect.get("x", 0))
-                    driver.execute_script("arguments[0].click();", controls[0])
-                    return True
+            for table in tables:
+                rows = [r for r in table.find_elements(By.XPATH, ".//tr") if visible(r)]
+                for row in rows[1:]:
+                    txt = norm(row.text)
+                    if txt and not ("MODELO" in txt and "MARCA" in txt and "COLOR" in txt):
+                        filas.append(row)
+                if filas:
+                    break
+            if filas:
+                break
     except Exception:
         pass
 
-    # 3. Fallback: el control visible más a la izquierda en el tercio inferior del modal.
-    if candidatos:
-        ys = [y for _, _, _, y in candidatos]
-        miny, maxy = min(ys), max(ys)
-        candidatos2 = [c for c in candidatos if c[3] > miny + (maxy - miny) * 0.25]
-        if candidatos2:
-            candidatos2.sort(key=lambda c: (c[2], c[3]))
-            driver.execute_script("arguments[0].click();", candidatos2[0][0])
-            return True
-    return False
+    if filas:
+        row = filas[0]
+        _log("  -> Fila del vehículo detectada; buscando lupa real")
 
+        # Primero: controles/elementos con onclick dentro de la primera celda.
+        try:
+            celdas = row.find_elements(By.XPATH, "./td")
+            celda = celdas[0] if celdas else row
+            candidatos = celda.find_elements(
+                By.XPATH,
+                ".//*[@onclick or @href or self::a or self::button or self::img or self::input or self::span]"
+            )
+            # incluir la propia celda por si el onclick vive allí
+            candidatos.append(celda)
+            vistos = set()
+            for raw in candidatos:
+                try:
+                    if raw.id in vistos or not visible(raw):
+                        continue
+                    vistos.add(raw.id)
+                    texto = _probar_y_confirmar(raw, "control primera celda")
+                    if texto:
+                        return texto
+                    # tras un click que no abrió el detalle, volver a ubicar el popup
+                    _activar_contexto_info_objeto(driver)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Segundo: click físico dentro de la primera celda/fila.
+        # En la captura la lupa está aproximadamente 15-25 px desde el borde izquierdo.
+        try:
+            target = (row.find_elements(By.XPATH, "./td") or [row])[0]
+            ancho = max(1, int(target.rect.get("width", 40)))
+            alto = max(1, int(target.rect.get("height", 25)))
+            offsets = [8, 14, 20, 26, 32]
+            for x in offsets:
+                x = min(x, max(1, ancho - 2))
+                try:
+                    ActionChains(driver).move_to_element_with_offset(target, x - ancho/2, 0).click().perform()
+                except Exception:
+                    # alternativa con coordenadas absolutas del centro del elemento
+                    try:
+                        r = target.rect
+                        cx = r.get("x", 0) + x
+                        cy = r.get("y", 0) + alto/2
+                        driver.execute_script(
+                            "const e=document.elementFromPoint(arguments[0]-window.scrollX,arguments[1]-window.scrollY);"
+                            "if(e){e.dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));"
+                            "e.dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));e.click();}",
+                            cx, cy
+                        )
+                    except Exception:
+                        continue
+                if acta:
+                    texto = esperar_datos_descriptivos(driver, acta, timeout=2.2)
+                    if texto:
+                        _log(f"  -> DATOS DESCRIPTIVOS abiertos (click físico x={x})")
+                        return texto
+                else:
+                    return True
+                _activar_contexto_info_objeto(driver)
+        except Exception:
+            pass
+
+    # 2) Fallback por geometría: imágenes/controles pequeños a la izquierda del modal.
+    try:
+        _activar_contexto_info_objeto(driver)
+        elems = driver.find_elements(By.XPATH, "//*[self::img or self::a or self::button or self::span or @onclick]")
+        candidatos = []
+        for e in elems:
+            if not visible(e):
+                continue
+            r = e.rect
+            w, h = r.get("width", 0), r.get("height", 0)
+            if 0 < w <= 60 and 0 < h <= 60:
+                candidatos.append((e, r.get("x", 0), r.get("y", 0)))
+        candidatos.sort(key=lambda z: (z[1], z[2]))
+        for e, x, y in candidatos:
+            meta = norm(" ".join([e.get_attribute("src") or "", e.get_attribute("title") or "", e.get_attribute("class") or ""]))
+            if "CERR" in meta or "CLOSE" in meta:
+                continue
+            texto = _probar_y_confirmar(e, f"fallback x={round(x)} y={round(y)}")
+            if texto:
+                return texto
+            _activar_contexto_info_objeto(driver)
+    except Exception:
+        pass
+
+    return None if acta else False
 
 def esperar_datos_descriptivos(driver, acta, timeout=10):
     """Espera la ventana final y la localiza aunque aparezca en otro iframe."""
@@ -818,12 +906,10 @@ class App:
             return None, "NO SE DETECTO INFORMACION DE OBJETO"
         self.log("  -> INFORMACION DE OBJETO detectada")
 
-        if not click_lupa(self.driver):
-            return None, "NO SE PUDO ABRIR LA LUPA"
-        self.log("  -> Lupa abierta; esperando DATOS DESCRIPTIVOS")
-        texto = esperar_datos_descriptivos(self.driver, acta, timeout=10)
+        self.log("  -> Abriendo lupa y confirmando DATOS DESCRIPTIVOS")
+        texto = click_lupa(self.driver, acta, self.log)
         if not texto:
-            return None, "NO SE ABRIO DATOS DESCRIPTIVOS"
+            return None, "NO SE PUDO ABRIR DATOS DESCRIPTIVOS DESDE LA LUPA"
         return extraer_datos(texto), None
 
     def procesar(self):
@@ -942,4 +1028,3 @@ if __name__ == "__main__":
     root = tk.Tk()
     App(root)
     root.mainloop()
-
