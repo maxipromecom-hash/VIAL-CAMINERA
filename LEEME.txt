@@ -1,0 +1,36 @@
+VERIFICADOR VIAL CAMINERA - VERSION DE PRUEBA
+==============================================
+
+OBJETIVO
+Compara los datos de cada fila del Excel con el acta correspondiente del sistema
+Consulta de Antecedentes. No almacena usuario ni contraseña.
+
+PRIMERA PRUEBA RECOMENDADA
+La aplicacion viene configurada con "Max. filas = 1" para probar primero una sola
+fila pendiente. En la planilla enviada, la primera pendiente es L4701368.
+
+USO
+1) Ejecute INSTALAR_Y_EJECUTAR.bat la primera vez.
+2) Seleccione el Excel.
+3) Pulse "1. ABRIR SISTEMA / INICIAR SESION".
+4) Inicie sesion normalmente en Chrome y abra CONSULTA DE ANTECEDENTES.
+5) Vuelva al programa y pulse "2. INICIAR VERIFICACION".
+6) Revise el resultado en OBSERVACIONES.
+
+RESULTADOS
+- VERIFICADO
+- NO COINCIDE: DOMINIO, MOTOR, CHASIS, etc.
+- NO ENCONTRADA EN SISTEMA
+- ERROR DE CONSULTA: ...
+
+SEGURIDAD DE DATOS
+- No se guarda usuario ni contraseña.
+- Se crea un respaldo antes de comenzar.
+- Se genera un archivo separado terminado en _VERIFICADO.xlsx.
+- El progreso se guarda despues de cada acta.
+
+IMPORTANTE
+Esta primera version utiliza selectores genericos porque el sistema es interno y
+no es accesible desde fuera de la red institucional. Si en la primera prueba no
+encuentra el campo Nro Acta o no abre correctamente el detalle, envie una captura
+del error y de la pantalla resultante. Con esa informacion se ajustan los selectores.
