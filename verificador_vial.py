@@ -1,5 +1,7 @@
 import os
 import re
+import sys
+import json
 import time
 import shutil
 import threading
@@ -18,7 +20,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-VERSION = "6.0"
+VERSION = "8.0"
 URL_LOGIN = "https://sistemas.seguridad.mendoza.gov.ar/vialcaminera//servlet/com.ktksuitelr.mdlsgt.hlogin2"
 URL_CONSULTA_HINT = "wpconsultaantecedentes"
 
@@ -34,8 +36,73 @@ COL_SUMARIO = 11       # K
 COL_OBS = 13           # M
 
 # Por decisión del usuario NO se comparan Motor ni Chasis.
-CAMPOS_COMPARADOS = ("FECHA", "TIPO VEHICULO", "MARCA/MODELO", "COLOR", "DOMINIO", "INTERVIENE")
+CAMPOS_COMPARADOS = ("TIPO VEHICULO", "MARCA/MODELO", "COLOR", "DOMINIO", "INTERVIENE", "DOMINIO↔ACTA")
 
+
+
+# Diccionario editable de normalización Marca/Modelo.
+DICCIONARIO_DEFAULT = {
+    "MOTO MEL": "MOTOMEL",
+    "MOTOMEL": "MOTOMEL",
+    "BUSSINES": "BUSINESS",
+    "BUSINES": "BUSINESS",
+    "BUSSINESS": "BUSINESS",
+    "ZANELLA SOL BUSSINES": "ZANELLA SOL BUSINESS",
+    "ZANELLA SOL BUSINES": "ZANELLA SOL BUSINESS",
+    "HONDA WAVE 110": "HONDA WAVE",
+    "HONDA WAVE110": "HONDA WAVE",
+    "CORVEN ENERGY 110": "CORVEN ENERGY",
+    "GILERA SMASH 110": "GILERA SMASH",
+    "YAMAHA YBR 125": "YAMAHA YBR"
+}
+
+def directorio_app():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+def cargar_diccionario_modelos():
+    ruta = os.path.join(directorio_app(), "diccionario_vehiculos.json")
+    data = dict(DICCIONARIO_DEFAULT)
+    try:
+        if os.path.exists(ruta):
+            with open(ruta, "r", encoding="utf-8") as f:
+                extra = json.load(f)
+            if isinstance(extra, dict):
+                data.update({norm(k): norm(v) for k, v in extra.items()})
+        else:
+            with open(ruta, "w", encoding="utf-8") as f:
+                json.dump(DICCIONARIO_DEFAULT, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return {norm(k): norm(v) for k, v in data.items()}
+
+DICCIONARIO_MODELOS = None
+
+def aplicar_diccionario_modelo(v):
+    global DICCIONARIO_MODELOS
+    if DICCIONARIO_MODELOS is None:
+        DICCIONARIO_MODELOS = cargar_diccionario_modelos()
+    n = normalizar_modelo(v)
+    # Sustituciones de frase completa y luego parciales.
+    if n in DICCIONARIO_MODELOS:
+        n = DICCIONARIO_MODELOS[n]
+    for k, val in sorted(DICCIONARIO_MODELOS.items(), key=lambda kv: len(kv[0]), reverse=True):
+        if k and k in n:
+            n = n.replace(k, val)
+    return norm(n)
+
+def combinar_marca_modelo(datos):
+    marca = str(datos.get("Marca", "") or "").strip()
+    modelo = str(datos.get("Modelo", "") or "").strip()
+    # Muchos registros GeneXus usan 0 como modelo vacío.
+    if norm(modelo) in {"", "0", "S D", "SD", "SIN MODELO"}:
+        modelo = ""
+    nm = norm(marca)
+    nmod = norm(modelo)
+    if nmod and nmod not in nm:
+        return (marca + " " + modelo).strip()
+    return marca or modelo
 
 def norm(v):
     if v is None:
@@ -169,25 +236,27 @@ def coincide_dominio(excel, web):
 
 
 def coincide_marca_modelo(excel, web):
-    a = normalizar_modelo(excel)
-    b = normalizar_modelo(web)
+    a = aplicar_diccionario_modelo(excel)
+    b = aplicar_diccionario_modelo(web)
     if not a:
+        return True
+    if not b:
+        return False
+    ca, cb = compact(a), compact(b)
+    if ca == cb or ca in cb or cb in ca:
         return True
     ta = tokens_significativos(a)
     tb = tokens_significativos(b)
     if not ta:
         return True
-    # Caso habitual: Excel ZANELLA BUSSINES / sistema ZANELLA SOL BUSINESS.
-    presentes = sum(1 for t in ta if t in tb)
-    if presentes / len(ta) >= 0.75:
-        return True
-    # Tolerancia a una pequeña falta OCR/ortográfica.
+    # Coincidencia por variables/palabras significativas.
     similares = 0
     for t in ta:
-        if any(SequenceMatcher(None, t, w).ratio() >= 0.80 for w in tb):
+        if t in tb or any(SequenceMatcher(None, t, w).ratio() >= 0.78 for w in tb):
             similares += 1
-    return similares / len(ta) >= 0.75
-
+    # La marca suele ser la primera variable y debe coincidir.
+    marca_ok = (ta[0] in tb) or any(SequenceMatcher(None, ta[0], w).ratio() >= 0.86 for w in tb)
+    return marca_ok and similares / len(ta) >= 0.60
 
 def acronimo(v):
     toks = tokens_significativos(v)
@@ -332,6 +401,56 @@ def find_input_acta(driver, log=None):
         except Exception:
             pass
     return None
+
+def find_input_dominio(driver, log=None):
+    def _log(msg):
+        if log:
+            try: log(msg)
+            except Exception: pass
+    inputs=[]
+    for e in driver.find_elements(By.CSS_SELECTOR, "input"):
+        try:
+            tipo=(e.get_attribute("type") or "text").lower()
+            if tipo not in {"text","search","tel","number",""} or not visible(e) or not e.is_enabled():
+                continue
+            if e.rect.get("width",0)>10 and e.rect.get("height",0)>5:
+                inputs.append(e)
+        except Exception: pass
+    labels=[]
+    xp="//*[not(*) and contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyzáéíóúñ','ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÑ'),'DOMINIO')]"
+    for lab in driver.find_elements(By.XPATH,xp):
+        try:
+            if visible(lab) and norm(lab.text) in {"DOMINIO","NRO DOMINIO","N DOMINIO"}: labels.append(lab)
+        except Exception: pass
+    cand=[]
+    for lab in labels:
+        lr=lab.rect; ly=lr.get('y',0)+lr.get('height',0)/2; rx=lr.get('x',0)+lr.get('width',0)
+        for inp in inputs:
+            ir=inp.rect; iy=ir.get('y',0)+ir.get('height',0)/2; dx=ir.get('x',0)-rx; dy=abs(iy-ly)
+            if dy<=35 and dx>=-20: cand.append((dy*10+max(dx,0),inp))
+    if cand:
+        cand.sort(key=lambda x:x[0]); e=cand[0][1]
+        _log("  Campo Dominio detectado: id='{}' name='{}'".format(e.get_attribute('id') or '',e.get_attribute('name') or ''))
+        return e
+    for e in inputs:
+        attrs=norm(' '.join([e.get_attribute('id') or '',e.get_attribute('name') or '',e.get_attribute('placeholder') or '']))
+        if 'DOMINIO' in attrs: return e
+    return None
+
+def cargar_input_geneXus(driver, inp, valor):
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
+        inp.click(); inp.send_keys(Keys.CONTROL,'a'); inp.send_keys(Keys.BACKSPACE)
+        for ch in str(valor):
+            inp.send_keys(ch); time.sleep(0.035)
+        inp.send_keys(Keys.TAB); time.sleep(0.25)
+        actual=(inp.get_attribute('value') or '').strip()
+        if compact(actual)==compact(valor): return True
+        driver.execute_script("""const el=arguments[0],val=arguments[1]; const p=Object.getPrototypeOf(el); const d=Object.getOwnPropertyDescriptor(p,'value'); if(d&&d.set)d.set.call(el,val); else el.value=val; ['input','change','keyup','blur'].forEach(t=>el.dispatchEvent(new Event(t,{bubbles:true})));""", inp, str(valor))
+        time.sleep(0.25)
+        return compact(inp.get_attribute('value') or '')==compact(valor)
+    except Exception:
+        return False
 
 def click_buscar(driver):
     xpaths = [
@@ -734,7 +853,7 @@ class App:
 
     def _ui(self):
         tk.Label(self.root, text="VERIFICADOR VIAL CAMINERA", font=("Segoe UI", 18, "bold")).pack(pady=(15, 3))
-        tk.Label(self.root, text=f"Versión {VERSION} · Verifica FECHA, TIPO, MARCA/MODELO, COLOR, DOMINIO e INTERVIENE. Motor y Chasis se omiten.", font=("Segoe UI", 10)).pack(pady=(0, 4))
+        tk.Label(self.root, text=f"Versión {VERSION} · Verifica TIPO, MARCA/MODELO, COLOR, DOMINIO, INTERVIENE y cruce DOMINIO↔ACTA. Fecha, Motor y Chasis se omiten.", font=("Segoe UI", 10)).pack(pady=(0, 4))
         tk.Label(self.root, text="No guarda usuario ni contraseña. La sesión se inicia manualmente en Chrome.", font=("Segoe UI", 9)).pack(pady=(0, 12))
 
         f = tk.Frame(self.root)
@@ -912,6 +1031,26 @@ class App:
             return None, "NO SE PUDO ABRIR DATOS DESCRIPTIVOS DESDE LA LUPA"
         return extraer_datos(texto), None
 
+    def consultar_dominio_contiene_acta(self, dominio, acta):
+        if dominio_sin_chapa(dominio):
+            return None, None  # no aplica
+        self.volver_consulta()
+        inp = find_input_dominio(self.driver, self.log)
+        if not inp:
+            return False, "NO SE ENCONTRO CAMPO DOMINIO"
+        if not cargar_input_geneXus(self.driver, inp, dominio):
+            return False, "EL SISTEMA NO ACEPTO EL DOMINIO"
+        self.log(f"  Verificación cruzada: Dominio {dominio} -> Acta {acta}")
+        if not click_buscar(self.driver):
+            inp.send_keys(Keys.ENTER)
+        time.sleep(0.7)
+        try:
+            WebDriverWait(self.driver, 10).until(lambda d: compact(acta) in compact(d.find_element(By.TAG_NAME,'body').text) or 'NO SE ENCONTR' in norm(d.find_element(By.TAG_NAME,'body').text))
+        except Exception:
+            pass
+        texto=self.driver.find_element(By.TAG_NAME,'body').text
+        return compact(acta) in compact(texto), None
+
     def procesar(self):
         try:
             limite = int(self.limite.get() or "0")
@@ -970,18 +1109,25 @@ class App:
                     f"Fecha={datos.get('Fecha de Labrado','')} | "
                     f"Tipo={datos.get('Tipo Vehículo','')} | "
                     f"Dominio={datos.get('Dominio','')} | "
-                    f"Marca={datos.get('Marca','')} | "
+                    f"Marca={datos.get('Marca','')} | Modelo={datos.get('Modelo','')} | "
                     f"Color={datos.get('Color','')} | "
                     f"Juzgado={datos.get('Juzgado','')} | Comisaría={datos.get('COMISARIA','')}"
                 )
 
                 web_interviene = " ".join(filter(None, [datos.get("Juzgado", ""), datos.get("COMISARIA", "")]))
+                self.log(
+                    "  Excel: "
+                    f"Tipo={ws.cell(fila, COL_TIPO).value or ''} | "
+                    f"Marca/Modelo={ws.cell(fila, COL_MARCA_MODELO).value or ''} | "
+                    f"Color={ws.cell(fila, COL_COLOR).value or ''} | "
+                    f"Dominio={ws.cell(fila, COL_DOMINIO).value or ''} | "
+                    f"Interviene={ws.cell(fila, COL_INTERVIENE).value or ''}"
+                )
                 fallas = []
-                if not coincide_fecha(ws.cell(fila, COL_FECHA).value, datos.get("Fecha de Labrado", "")):
-                    fallas.append("FECHA")
                 if not coincide_tipo(ws.cell(fila, COL_TIPO).value, datos.get("Tipo Vehículo", "")):
                     fallas.append("TIPO VEHICULO")
-                if not coincide_marca_modelo(ws.cell(fila, COL_MARCA_MODELO).value, datos.get("Marca", "")):
+                web_marca_modelo = combinar_marca_modelo(datos)
+                if not coincide_marca_modelo(ws.cell(fila, COL_MARCA_MODELO).value, web_marca_modelo):
                     fallas.append("MARCA/MODELO")
                 if not coincide_color(ws.cell(fila, COL_COLOR).value, datos.get("Color", "")):
                     fallas.append("COLOR")
@@ -990,14 +1136,30 @@ class App:
                 if not coincide_interviene(ws.cell(fila, COL_INTERVIENE).value, web_interviene):
                     fallas.append("INTERVIENE")
 
+                dominio_excel = ws.cell(fila, COL_DOMINIO).value
+                cruce_ok = None
+                if not dominio_sin_chapa(dominio_excel):
+                    cruce_ok, cruce_error = self.consultar_dominio_contiene_acta(str(dominio_excel).strip(), acta)
+                    if cruce_error:
+                        self.log(f"  -> Cruce dominio-acta no pudo verificarse: {cruce_error}")
+                    elif cruce_ok:
+                        self.log("  -> DOMINIO ASOCIA EL ACTA")
+                    else:
+                        fallas.append("DOMINIO NO ASOCIA ACTA")
+                        self.log("  -> DOMINIO NO ASOCIA EL ACTA")
+
                 if fallas:
                     ws.cell(fila, COL_OBS).value = "NO COINCIDE: " + ", ".join(fallas)
                     diferencias += 1
                     self.log("  -> DIFERENCIAS: " + ", ".join(fallas))
                 else:
-                    ws.cell(fila, COL_OBS).value = "VERIFICADO"
+                    if cruce_ok is True:
+                        ws.cell(fila, COL_OBS).value = "VERIFICADO POR ACTA Y DOMINIO"
+                        self.log("  -> VERIFICADO POR ACTA Y DOMINIO")
+                    else:
+                        ws.cell(fila, COL_OBS).value = "VERIFICADO"
+                        self.log("  -> VERIFICADO")
                     verificados += 1
-                    self.log("  -> VERIFICADO")
 
                 wb.save(salida)
                 # Reinicia la pantalla antes de la siguiente acta.
