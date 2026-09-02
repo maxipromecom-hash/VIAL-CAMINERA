@@ -4,7 +4,8 @@ import time
 import shutil
 import threading
 import unicodedata
-from datetime import datetime
+from datetime import datetime, date
+from difflib import SequenceMatcher
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
@@ -14,175 +15,491 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
+VERSION = "2.0"
 URL_LOGIN = "https://sistemas.seguridad.mendoza.gov.ar/vialcaminera//servlet/com.ktksuitelr.mdlsgt.hlogin2"
 URL_CONSULTA_HINT = "wpconsultaantecedentes"
 
-# Columnas del Excel actual
-COL_SUMARIO = 11      # K
-COL_OBS = 13          # M
+# Estructura de la planilla Playa San Ignacio de Loyola
 HEADER_ROW = 3
+COL_FECHA = 2          # B
+COL_TIPO = 3           # C
+COL_MARCA_MODELO = 4   # D
+COL_COLOR = 5          # E
+COL_DOMINIO = 6        # F
+COL_INTERVIENE = 10    # J
+COL_SUMARIO = 11       # K
+COL_OBS = 13           # M
 
-# Campos a contrastar. Se comparan solo si el valor de Excel es utilizable.
-CAMPOS = {
-    3: "TIPO VEHICULO",   # C
-    4: "MARCA/MODELO",    # D
-    5: "COLOR",           # E
-    6: "DOMINIO",         # F
-    7: "MOTOR",           # G
-    8: "CHASIS",          # H
-    9: "MOTIVO",          # I
-    10: "INTERVIENE",     # J
-}
-
-IGNORAR_EXCEL = {
-    "", "S/D", "SD", "SIN DATO", "SIN DATOS", "NO SE DIVISA",
-    "NO SE OBSERVA", "NO POSEE", "SIN DOMINIO", "S/CHAPA", "S/ CHAPA"
-}
+# Por decisión del usuario NO se comparan Motor ni Chasis.
+CAMPOS_COMPARADOS = ("FECHA", "TIPO VEHICULO", "MARCA/MODELO", "COLOR", "DOMINIO", "INTERVIENE")
 
 
-def norm(s):
-    if s is None:
+def norm(v):
+    if v is None:
         return ""
-    s = str(s).upper().strip()
+    s = str(v).upper().strip()
     s = unicodedata.normalize("NFD", s)
     s = "".join(c for c in s if unicodedata.category(c) != "Mn")
-    # Normalización fuerte para números alfanuméricos, dominios, motor/chasis.
     s = re.sub(r"[^A-Z0-9]+", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
 
-def compact(s):
-    return re.sub(r"[^A-Z0-9]", "", norm(s))
+def compact(v):
+    return re.sub(r"[^A-Z0-9]", "", norm(v))
 
 
-def valor_ignorable(v):
+def xpath_literal(s):
+    s = str(s)
+    if "'" not in s:
+        return f"'{s}'"
+    if '"' not in s:
+        return f'"{s}"'
+    parts = s.split("'")
+    return "concat(" + ", \"'\", ".join(f"'{p}'" for p in parts) + ")"
+
+
+def visible(el):
+    try:
+        return el.is_displayed()
+    except Exception:
+        return False
+
+
+def fecha_excel(v):
+    if isinstance(v, (datetime, date)):
+        return v.strftime("%d/%m/%Y")
+    s = norm(v)
+    m = re.search(r"(\d{1,2})[ /.-](\d{1,2})[ /.-](\d{2,4})", s)
+    if m:
+        d, mo, y = m.groups()
+        if len(y) == 2:
+            y = "20" + y
+        return f"{int(d):02d}/{int(mo):02d}/{y}"
+    return str(v or "").strip()
+
+
+def normalizar_tipo(v):
     n = norm(v)
-    if n in IGNORAR_EXCEL:
+    aliases = {
+        "MOTO": "MOTOCICLETA",
+        "MOTOCICLETA": "MOTOCICLETA",
+        "MOTOVEHICULO": "MOTOCICLETA",
+        "AUTO": "AUTOMOVIL",
+        "AUTOMOVIL": "AUTOMOVIL",
+        "AUTOMOTOR": "AUTOMOVIL",
+        "CAMIONETA": "CAMIONETA",
+        "CAMION": "CAMION",
+        "BICIMOTO": "BICIMOTO",
+    }
+    return aliases.get(n, n)
+
+
+def normalizar_color(v):
+    n = norm(v)
+    cambios = {
+        "NEGRA": "NEGRO", "NEGRO": "NEGRO",
+        "BLANCA": "BLANCO", "BLANCO": "BLANCO",
+        "ROJA": "ROJO", "ROJO": "ROJO",
+        "VERDE": "VERDE", "GRIS": "GRIS",
+        "AZUL": "AZUL", "AMARILLA": "AMARILLO", "AMARILLO": "AMARILLO",
+    }
+    toks = [cambios.get(t, t) for t in n.split()]
+    return " ".join(toks)
+
+
+def dominio_sin_chapa(v):
+    n = norm(v)
+    return n in {
+        "", "S D", "SD", "S CHAPA", "SIN CHAPA", "SIN DOMINIO",
+        "NO POSEE", "NO POSEE DOMINIO", "NO SE DIVISA", "NO SE OBSERVA"
+    }
+
+
+def normalizar_modelo(v):
+    n = norm(v)
+    reemplazos = {
+        "BUSSINES": "BUSINESS",
+        "BUSINES": "BUSINESS",
+        "BUSSINESS": "BUSINESS",
+        "MOTOMEL": "MOTOMEL",
+    }
+    toks = []
+    for t in n.split():
+        t = reemplazos.get(t, t)
+        # La cilindrada no debe provocar una diferencia si el sistema no la muestra.
+        if re.fullmatch(r"\d{2,4}CC", t) or t == "CC":
+            continue
+        toks.append(t)
+    return " ".join(toks)
+
+
+def tokens_significativos(v):
+    stop = {"DE", "DEL", "LA", "EL", "LOS", "LAS", "Y", "N", "NRO", "NUMERO", "CALLE", "AV", "AVENIDA"}
+    return [t for t in norm(v).split() if len(t) >= 2 and t not in stop]
+
+
+def coincide_fecha(excel, web):
+    f = fecha_excel(excel)
+    return bool(f) and f in str(web or "")
+
+
+def coincide_tipo(excel, web):
+    return normalizar_tipo(excel) == normalizar_tipo(web) or compact(normalizar_tipo(excel)) in compact(normalizar_tipo(web))
+
+
+def coincide_color(excel, web):
+    a = normalizar_color(excel)
+    b = normalizar_color(web)
+    if not a:
         return True
-    if n.startswith("S CHAPA") and len(compact(v)) <= 6:
+    ta = set(a.split())
+    tb = set(b.split())
+    return bool(ta) and ta.issubset(tb)
+
+
+def coincide_dominio(excel, web):
+    if dominio_sin_chapa(excel):
+        return dominio_sin_chapa(web)
+    a = compact(excel)
+    b = compact(web)
+    return bool(a) and (a == b or a in b or b in a)
+
+
+def coincide_marca_modelo(excel, web):
+    a = normalizar_modelo(excel)
+    b = normalizar_modelo(web)
+    if not a:
         return True
-    return False
+    ta = tokens_significativos(a)
+    tb = tokens_significativos(b)
+    if not ta:
+        return True
+    # Caso habitual: Excel ZANELLA BUSSINES / sistema ZANELLA SOL BUSINESS.
+    presentes = sum(1 for t in ta if t in tb)
+    if presentes / len(ta) >= 0.75:
+        return True
+    # Tolerancia a una pequeña falta OCR/ortográfica.
+    similares = 0
+    for t in ta:
+        if any(SequenceMatcher(None, t, w).ratio() >= 0.80 for w in tb):
+            similares += 1
+    return similares / len(ta) >= 0.75
 
 
-def palabras_significativas(v):
-    stop = {"CC", "C", "DE", "DEL", "LA", "EL", "Y", "LEY", "NRO", "N"}
-    return [p for p in norm(v).split() if len(p) >= 3 and p not in stop]
+def acronimo(v):
+    toks = tokens_significativos(v)
+    return "".join(t[0] for t in toks if t)
 
 
-def coincide(valor_excel, texto_web, campo):
-    if valor_ignorable(valor_excel):
+def coincide_interviene(excel, web):
+    a = norm(excel)
+    b = norm(web)
+    if not a:
+        return True
+    ca, cb = compact(a), compact(b)
+    if ca and ca in cb:
         return True
 
-    ve = norm(valor_excel)
-    wc = compact(texto_web)
-    vc = compact(valor_excel)
-
-    # Identificadores exactos: dominio, motor, chasis.
-    if campo in {"DOMINIO", "MOTOR", "CHASIS"}:
-        # Si el Excel dice S/CHAPA pero contiene un dominio entre paréntesis, extraerlo.
-        if campo == "DOMINIO":
-            candidatos = re.findall(r"\b[A-Z]{2,3}\d{3}[A-Z]{0,2}\b|\b[A-Z]\d{3}[A-Z]{3}\b|\b\d{3}[A-Z]{3}\b", ve)
-            if candidatos:
-                return any(compact(x) in wc for x in candidatos)
-        return bool(vc) and vc in wc
-
-    # Para marca/modelo, tipo, color, motivo, dependencia: basta que la mayoría
-    # de palabras significativas figure en el detalle visible.
-    toks = palabras_significativas(valor_excel)
-    if not toks:
+    # U.R.V.G.A. equivale a U.R.V. GENERAL ALVEAR.
+    # Se compara también por iniciales de las palabras de la dependencia.
+    ac_web = acronimo(b)
+    ac_excel = acronimo(a)
+    if ca and (ca in ac_web or ac_web in ca):
         return True
-    presentes = sum(1 for t in toks if compact(t) in wc)
-    umbral = 1 if len(toks) <= 2 else max(2, int(len(toks) * 0.65 + 0.49))
-    return presentes >= umbral
+    if ac_excel and (ac_excel in ac_web or ac_web in ac_excel):
+        return True
+
+    ta = tokens_significativos(a)
+    tb = tokens_significativos(b)
+    if not ta:
+        return True
+    presentes = sum(1 for t in ta if t in tb)
+    return presentes / len(ta) >= 0.60
 
 
-def find_input_by_label(driver, label_text):
-    # 1) Buscar label y un input cercano.
-    xpath = (
-        f"//*[contains(translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyzáéíóúñ', "
-        f"'ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÑ'), '{label_text.upper()}')]"
+def find_input_acta(driver):
+    # Primero: input asociado al texto Nro Acta.
+    etiquetas = driver.find_elements(
+        By.XPATH,
+        "//*[contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyzáéíóúñ','ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÑ'),'NRO ACTA')]"
     )
-    elems = driver.find_elements(By.XPATH, xpath)
-    for el in elems:
-        try:
-            # input dentro del mismo contenedor o inmediatamente cercano
-            for xp in [".//input", "./following::input[1]", "../following-sibling::*//input[1]", "../input[1]"]:
-                cand = el.find_elements(By.XPATH, xp)
-                if cand and cand[0].is_displayed() and cand[0].is_enabled():
-                    return cand[0]
-        except Exception:
-            pass
+    for et in etiquetas:
+        for xp in ["./following::input[1]", "../following-sibling::*//input[1]", "../input[1]", ".//input[1]"]:
+            try:
+                for inp in et.find_elements(By.XPATH, xp):
+                    if visible(inp) and inp.is_enabled():
+                        return inp
+            except Exception:
+                pass
 
-    # 2) Heurísticas por atributos.
-    for css in [
-        "input[name*='ACTA' i]", "input[id*='ACTA' i]",
-        "input[name*='NRO' i]", "input[id*='NRO' i]",
-    ]:
-        try:
-            cands = driver.find_elements(By.CSS_SELECTOR, css)
-            for c in cands:
-                if c.is_displayed() and c.is_enabled():
-                    return c
-        except Exception:
-            pass
+    # Fallback por posición: el input visible más cercano al label Nro Acta.
+    inputs = [e for e in driver.find_elements(By.CSS_SELECTOR, "input") if visible(e) and e.is_enabled()]
+    for e in inputs:
+        attrs = " ".join([e.get_attribute("id") or "", e.get_attribute("name") or "", e.get_attribute("placeholder") or ""])
+        if "ACTA" in norm(attrs):
+            return e
     return None
 
 
 def click_buscar(driver):
-    candidatos = driver.find_elements(By.XPATH,
-        "//button[contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'BUSCAR')]"
-        "|//input[@type='button' or @type='submit'][contains(translate(@value,'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'BUSCAR')]"
-        "|//a[contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'BUSCAR')]"
-    )
-    for e in candidatos:
-        if e.is_displayed() and e.is_enabled():
+    xpaths = [
+        "//button[contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'BUSCAR')]",
+        "//input[(@type='button' or @type='submit') and contains(translate(@value,'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'BUSCAR')]",
+        "//a[contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'BUSCAR')]",
+    ]
+    for xp in xpaths:
+        for e in driver.find_elements(By.XPATH, xp):
+            if visible(e) and e.is_enabled():
+                driver.execute_script("arguments[0].click();", e)
+                return True
+    return False
+
+
+def esperar_resultado_acta(driver, acta, timeout=10):
+    lit = xpath_literal(acta)
+    xp = f"//*[normalize-space(text())={lit}]"
+    try:
+        WebDriverWait(driver, timeout).until(lambda d: any(visible(e) for e in d.find_elements(By.XPATH, xp)))
+        elems = [e for e in driver.find_elements(By.XPATH, xp) if visible(e)]
+        return elems[-1] if elems else None
+    except TimeoutException:
+        return None
+
+
+def clickable_from_element(el):
+    try:
+        tag = (el.tag_name or "").lower()
+        if tag in {"a", "button", "input"}:
+            return el
+        if tag == "img":
+            anc = el.find_elements(By.XPATH, "./ancestor::*[self::a or self::button][1]")
+            return anc[0] if anc else el
+    except Exception:
+        pass
+    return el
+
+
+def click_tres_puntos(driver, acta_el):
+    """Abre Información de Objeto desde la fila del resultado."""
+    try:
+        row = acta_el.find_elements(By.XPATH, "./ancestor::tr[1]")
+        row = row[0] if row else None
+    except Exception:
+        row = None
+
+    scope = row if row is not None else driver
+    candidatos = []
+    try:
+        elems = scope.find_elements(By.XPATH, ".//*[self::a or self::button or self::input or self::img]" if row is not None else "//*[self::a or self::button or self::input or self::img]")
+        seen = set()
+        for raw in elems:
+            e = clickable_from_element(raw)
+            try:
+                if not visible(e) or not e.is_enabled():
+                    continue
+                key = e.id
+                if key in seen:
+                    continue
+                seen.add(key)
+                r = e.rect
+                if r.get("width", 0) <= 0 or r.get("height", 0) <= 0:
+                    continue
+                meta = " ".join([
+                    e.text or "", e.get_attribute("title") or "", e.get_attribute("alt") or "",
+                    e.get_attribute("aria-label") or "", e.get_attribute("class") or "",
+                    e.get_attribute("src") or ""
+                ])
+                candidatos.append((e, norm(meta), r.get("x", 0)))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Preferencias semánticas.
+    for palabra in ("DETALLE", "INFORMACION", "OBJETO", "ACCION", "OPCION", "MENU", "PUNTOS"):
+        for e, meta, _ in candidatos:
+            if palabra in meta:
+                driver.execute_script("arguments[0].click();", e)
+                return True
+    for e, meta, _ in candidatos:
+        if "..." in (e.text or "") or "•••" in (e.text or ""):
             driver.execute_script("arguments[0].click();", e)
+            return True
+
+    # En este sistema hay dos íconos al extremo derecho de la fila:
+    # tres puntos y luego otro ícono. El botón de tres puntos es el segundo desde la derecha.
+    if row is not None and len(candidatos) >= 2:
+        candidatos.sort(key=lambda x: x[2])
+        target = candidatos[-2][0]
+        driver.execute_script("arguments[0].click();", target)
+        return True
+    return False
+
+
+def esperar_info_objeto(driver, timeout=6):
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: "INFORMACION DE OBJETO" in norm(d.find_element(By.TAG_NAME, "body").text)
+        )
+        return True
+    except Exception:
+        return False
+
+
+def click_lupa(driver):
+    """Dentro de Información de Objeto, abre Objetos Datos Descriptivos."""
+    body_norm = norm(driver.find_element(By.TAG_NAME, "body").text)
+    if "INFORMACION DE OBJETO" not in body_norm:
+        return False
+
+    # 1. Imágenes/enlaces cuyo nombre sugiera búsqueda/lupa/detalle.
+    elems = driver.find_elements(By.XPATH, "//*[self::img or self::a or self::button]")
+    candidatos = []
+    for raw in elems:
+        e = clickable_from_element(raw)
+        try:
+            if not visible(e) or not e.is_enabled():
+                continue
+            meta = norm(" ".join([
+                e.text or "", e.get_attribute("title") or "", e.get_attribute("alt") or "",
+                e.get_attribute("aria-label") or "", e.get_attribute("src") or "",
+                e.get_attribute("class") or ""
+            ]))
+            r = e.rect
+            candidatos.append((e, meta, r.get("x", 0), r.get("y", 0)))
+        except Exception:
+            pass
+    for palabra in ("LUPA", "SEARCH", "CONSULT", "DETALLE", "DESCRIPT"):
+        for e, meta, _, _ in candidatos:
+            if palabra in meta and "CERR" not in meta:
+                driver.execute_script("arguments[0].click();", e)
+                return True
+
+    # 2. Buscar la tabla que tiene los encabezados Modelo / Marca / Color y tomar
+    # el primer control clickeable de la primera fila de datos.
+    try:
+        headers = driver.find_elements(By.XPATH, "//*[normalize-space(text())='Modelo' or normalize-space(text())='Marca']")
+        for h in headers:
+            if not visible(h):
+                continue
+            tables = h.find_elements(By.XPATH, "./ancestor::table[1]")
+            if not tables:
+                continue
+            table = tables[0]
+            rows = table.find_elements(By.XPATH, ".//tr")
+            for row in rows[1:]:
+                if not visible(row):
+                    continue
+                controls = row.find_elements(By.XPATH, ".//*[self::a or self::button or self::img or self::input]")
+                controls = [clickable_from_element(c) for c in controls]
+                controls = [c for c in controls if visible(c)]
+                if controls:
+                    controls.sort(key=lambda c: c.rect.get("x", 0))
+                    driver.execute_script("arguments[0].click();", controls[0])
+                    return True
+    except Exception:
+        pass
+
+    # 3. Fallback: el control visible más a la izquierda en el tercio inferior del modal.
+    if candidatos:
+        ys = [y for _, _, _, y in candidatos]
+        miny, maxy = min(ys), max(ys)
+        candidatos2 = [c for c in candidatos if c[3] > miny + (maxy - miny) * 0.25]
+        if candidatos2:
+            candidatos2.sort(key=lambda c: (c[2], c[3]))
+            driver.execute_script("arguments[0].click();", candidatos2[0][0])
             return True
     return False
 
 
-def abrir_detalle_si_existe(driver):
-    # Intenta el botón de tres puntos / detalle visible de la primera fila de resultados.
-    xpaths = [
-        "//*[contains(@title,'Detalle') or contains(@title,'detalle')][1]",
-        "//button[contains(normalize-space(.),'...')][1]",
-        "//a[contains(normalize-space(.),'...')][1]",
-        "//table//tbody//tr[1]//*[self::button or self::a][last()]",
+def esperar_datos_descriptivos(driver, acta, timeout=7):
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: (
+                "OBJETOS DATOS DESCRIPTIVOS" in norm(d.find_element(By.TAG_NAME, "body").text)
+                and compact(acta) in compact(d.find_element(By.TAG_NAME, "body").text)
+                and "TIPO VEHICULO" in norm(d.find_element(By.TAG_NAME, "body").text)
+                and "DOMINIO" in norm(d.find_element(By.TAG_NAME, "body").text)
+            )
+        )
+        return driver.find_element(By.TAG_NAME, "body").text
+    except Exception:
+        return None
+
+
+def extraer_campo(texto, etiqueta, siguientes):
+    """Extrae un valor por líneas. Funciona con el innerText de la ventana del sistema."""
+    lines = [re.sub(r"\s+", " ", x).strip() for x in str(texto or "").splitlines() if x.strip()]
+    et = norm(etiqueta)
+    sigs = {norm(s) for s in siguientes}
+    for i, line in enumerate(lines):
+        nl = norm(line)
+        # Etiqueta y valor en la misma línea.
+        if nl == et or nl.startswith(et + " "):
+            resto = line[len(line.split()[0]):].strip() if False else ""
+            # Si el texto está en una sola línea, sacar lo que siga a la etiqueta original.
+            m = re.match(rf"(?i)^\s*{re.escape(etiqueta)}\s*[:\-]?\s*(.+)$", line)
+            if m and m.group(1).strip():
+                return m.group(1).strip()
+            # En GeneXus normalmente el valor queda en la línea siguiente.
+            for j in range(i + 1, min(len(lines), i + 4)):
+                if norm(lines[j]) in sigs:
+                    break
+                return lines[j]
+    return ""
+
+
+def extraer_datos(texto):
+    etiquetas = [
+        "Acta", "Fecha de Labrado", "Retiene Licencia", "Número de Licencia",
+        "Categoria Licencia", "Procedencia Licencia", "Vto. de Licencia",
+        "Tipo Vehículo", "Dominio", "Marca", "Color", "Modelo", "Juzgado",
+        "COMISARIA", "Usuario", "Lugar"
     ]
-    for xp in xpaths:
-        try:
-            elems = driver.find_elements(By.XPATH, xp)
-            for e in elems:
-                if e.is_displayed() and e.is_enabled():
-                    before = driver.current_url
-                    driver.execute_script("arguments[0].click();", e)
-                    time.sleep(0.8)
-                    return before
-        except Exception:
-            pass
-    return None
+    datos = {}
+    for e in etiquetas:
+        datos[e] = extraer_campo(texto, e, etiquetas)
+
+    # Fallback regex multiline específico para los campos que necesitamos.
+    patrones = {
+        "Acta": r"(?im)^\s*Acta\s+([^\r\n]+)$",
+        "Fecha de Labrado": r"(?im)^\s*Fecha\s+de\s+Labrado\s+([^\r\n]+)$",
+        "Tipo Vehículo": r"(?im)^\s*Tipo\s+Veh[ií]culo\s+([^\r\n]+)$",
+        "Dominio": r"(?im)^\s*Dominio\s+([^\r\n]+)$",
+        "Marca": r"(?im)^\s*Marca\s+([^\r\n]+)$",
+        "Color": r"(?im)^\s*Color\s+([^\r\n]+)$",
+        "Modelo": r"(?im)^\s*Modelo\s+([^\r\n]+)$",
+        "Juzgado": r"(?im)^\s*Juzgado\s+([^\r\n]+)$",
+        "COMISARIA": r"(?im)^\s*COMISARIA\s+([^\r\n]+)$",
+    }
+    for k, pat in patrones.items():
+        if not datos.get(k):
+            m = re.search(pat, texto or "")
+            if m:
+                datos[k] = m.group(1).strip()
+    return datos
 
 
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Verificador Vial Caminera")
-        self.root.geometry("860x650")
-        self.root.minsize(760, 560)
+        self.root.title(f"Verificador Vial Caminera v{VERSION}")
+        self.root.geometry("920x690")
+        self.root.minsize(820, 600)
         self.driver = None
+        self.consulta_url = None
         self.stop_flag = False
         self.archivo = tk.StringVar()
         self.solo_pendientes = tk.BooleanVar(value=True)
-        self.abrir_detalle = tk.BooleanVar(value=True)
         self.limite = tk.StringVar(value="1")
         self._ui()
 
     def _ui(self):
-        tk.Label(self.root, text="VERIFICADOR VIAL CAMINERA", font=("Segoe UI", 18, "bold")).pack(pady=(15, 4))
-        tk.Label(self.root, text="Compara cada fila del Excel con el acta consultada en el sistema. No guarda usuario ni contraseña.", font=("Segoe UI", 10)).pack(pady=(0, 12))
+        tk.Label(self.root, text="VERIFICADOR VIAL CAMINERA", font=("Segoe UI", 18, "bold")).pack(pady=(15, 3))
+        tk.Label(self.root, text=f"Versión {VERSION} · Verifica FECHA, TIPO, MARCA/MODELO, COLOR, DOMINIO e INTERVIENE. Motor y Chasis se omiten.", font=("Segoe UI", 10)).pack(pady=(0, 4))
+        tk.Label(self.root, text="No guarda usuario ni contraseña. La sesión se inicia manualmente en Chrome.", font=("Segoe UI", 9)).pack(pady=(0, 12))
 
         f = tk.Frame(self.root)
         f.pack(fill="x", padx=20)
@@ -192,9 +509,9 @@ class App:
         opts = tk.Frame(self.root)
         opts.pack(fill="x", padx=20, pady=10)
         tk.Checkbutton(opts, text="Saltar filas ya VERIFICADAS", variable=self.solo_pendientes).pack(side="left")
-        tk.Checkbutton(opts, text="Intentar abrir detalle del acta", variable=self.abrir_detalle).pack(side="left", padx=15)
-        tk.Label(opts, text="Máx. filas (0 = todas):").pack(side="left")
+        tk.Label(opts, text="Máx. filas (0 = todas):").pack(side="left", padx=(25, 0))
         tk.Entry(opts, textvariable=self.limite, width=5).pack(side="left", padx=5)
+        tk.Label(opts, text="Para la primera prueba deje 1.", font=("Segoe UI", 9, "italic")).pack(side="left", padx=8)
 
         botones = tk.Frame(self.root)
         botones.pack(fill="x", padx=20, pady=(0, 10))
@@ -204,7 +521,7 @@ class App:
 
         self.estado = tk.Label(self.root, text="Listo.", anchor="w", font=("Segoe UI", 10, "bold"))
         self.estado.pack(fill="x", padx=20, pady=(2, 5))
-        self.logbox = ScrolledText(self.root, height=25, font=("Consolas", 9))
+        self.logbox = ScrolledText(self.root, height=26, font=("Consolas", 9))
         self.logbox.pack(fill="both", expand=True, padx=20, pady=(0, 15))
 
     def log(self, msg):
@@ -232,9 +549,10 @@ class App:
             opts.add_experimental_option("detach", True)
             self.driver = webdriver.Chrome(options=opts)
             self.driver.get(URL_LOGIN)
+            self.consulta_url = None
             self.log("Chrome abierto. Inicie sesión normalmente y entre a CONSULTA DE ANTECEDENTES.")
-            self.set_estado("Esperando que inicie sesión y abra Consulta de Antecedentes...")
-            messagebox.showinfo("Paso 1", "Inicie sesión en la ventana de Chrome y abra 'CONSULTA DE ANTECEDENTES'.\n\nDespués vuelva aquí y pulse 'INICIAR VERIFICACIÓN'.")
+            self.set_estado("Esperando inicio de sesión...")
+            messagebox.showinfo("Paso 1", "Inicie sesión en Chrome y abra 'CONSULTA DE ANTECEDENTES'.\n\nDespués vuelva al programa y pulse 'INICIAR VERIFICACIÓN'.")
         except WebDriverException as e:
             messagebox.showerror("Chrome/Selenium", f"No pude abrir Chrome.\n\n{e}")
 
@@ -249,8 +567,49 @@ class App:
         if not self.driver:
             messagebox.showwarning("Sistema", "Primero pulse 'ABRIR SISTEMA / INICIAR SESIÓN'.")
             return
+        try:
+            if URL_CONSULTA_HINT not in (self.driver.current_url or "").lower():
+                messagebox.showwarning("Sistema", "Chrome todavía no está en 'Consulta de Antecedentes'.\n\nAbra esa opción en el sistema y vuelva a intentar.")
+                return
+            self.consulta_url = self.driver.current_url
+        except Exception:
+            pass
         self.stop_flag = False
         threading.Thread(target=self.procesar, daemon=True).start()
+
+    def volver_consulta(self):
+        if not self.consulta_url:
+            return
+        self.driver.get(self.consulta_url)
+        WebDriverWait(self.driver, 8).until(lambda d: find_input_acta(d) is not None)
+
+    def consultar_acta(self, acta):
+        self.volver_consulta()
+        inp = find_input_acta(self.driver)
+        if not inp:
+            raise RuntimeError("No encontré el campo Nro Acta.")
+        inp.click()
+        inp.send_keys(Keys.CONTROL, "a")
+        inp.send_keys(Keys.BACKSPACE)
+        inp.send_keys(acta)
+        if not click_buscar(self.driver):
+            inp.send_keys(Keys.ENTER)
+
+        acta_el = esperar_resultado_acta(self.driver, acta, timeout=10)
+        if not acta_el:
+            return None, "NO ENCONTRADA"
+
+        if not click_tres_puntos(self.driver, acta_el):
+            return None, "NO SE PUDO ABRIR LOS TRES PUNTOS"
+        if not esperar_info_objeto(self.driver, timeout=6):
+            return None, "NO SE ABRIO INFORMACION DE OBJETO"
+
+        if not click_lupa(self.driver):
+            return None, "NO SE PUDO ABRIR LA LUPA"
+        texto = esperar_datos_descriptivos(self.driver, acta, timeout=7)
+        if not texto:
+            return None, "NO SE ABRIO DATOS DESCRIPTIVOS"
+        return extraer_datos(texto), None
 
     def procesar(self):
         try:
@@ -269,11 +628,7 @@ class App:
 
         wb = load_workbook(p)
         ws = wb.active
-        total = 0
-        verificados = 0
-        diferencias = 0
-        no_encontrados = 0
-        errores = 0
+        total = verificados = diferencias = no_encontrados = errores = 0
 
         for fila in range(HEADER_ROW + 1, ws.max_row + 1):
             if self.stop_flag:
@@ -286,48 +641,53 @@ class App:
                 continue
             if limite and total >= limite:
                 break
+
             total += 1
             acta = str(acta).strip()
             self.set_estado(f"Fila {fila} · Acta {acta}")
             self.log(f"Consultando fila {fila} - Acta {acta}...")
 
             try:
-                inp = find_input_by_label(self.driver, "NRO ACTA") or find_input_by_label(self.driver, "NRO. ACTA")
-                if not inp:
-                    raise RuntimeError("No encontré el campo 'Nro Acta'. Verifique que esté en Consulta de Antecedentes.")
-
-                inp.click()
-                inp.send_keys(Keys.CONTROL, "a")
-                inp.send_keys(acta)
-                if not click_buscar(self.driver):
-                    inp.send_keys(Keys.ENTER)
-                time.sleep(1.2)
-
-                body = self.driver.find_element(By.TAG_NAME, "body").text
-                body_n = compact(body)
-                acta_c = compact(acta)
-                if acta_c not in body_n:
-                    ws.cell(fila, COL_OBS).value = "NO ENCONTRADA EN SISTEMA"
-                    no_encontrados += 1
-                    self.log("  -> NO ENCONTRADA")
+                datos, problema = self.consultar_acta(acta)
+                if problema:
+                    if problema == "NO ENCONTRADA":
+                        ws.cell(fila, COL_OBS).value = "NO ENCONTRADA EN SISTEMA"
+                        no_encontrados += 1
+                        self.log("  -> NO ENCONTRADA")
+                    else:
+                        ws.cell(fila, COL_OBS).value = f"ERROR DE NAVEGACION: {problema}"
+                        errores += 1
+                        self.log(f"  -> {problema}")
                     wb.save(salida)
+                    # Ante un problema de navegación, detener la prueba para no crear falsos resultados.
+                    if problema != "NO ENCONTRADA":
+                        break
                     continue
 
-                url_antes_detalle = None
-                if self.abrir_detalle.get():
-                    url_antes_detalle = abrir_detalle_si_existe(self.driver)
-                    if url_antes_detalle:
-                        try:
-                            WebDriverWait(self.driver, 4).until(lambda d: len(d.find_element(By.TAG_NAME, "body").text) > 50)
-                        except Exception:
-                            pass
-                        body = self.driver.find_element(By.TAG_NAME, "body").text
+                self.log(
+                    "  Sistema: "
+                    f"Fecha={datos.get('Fecha de Labrado','')} | "
+                    f"Tipo={datos.get('Tipo Vehículo','')} | "
+                    f"Dominio={datos.get('Dominio','')} | "
+                    f"Marca={datos.get('Marca','')} | "
+                    f"Color={datos.get('Color','')} | "
+                    f"Juzgado={datos.get('Juzgado','')} | Comisaría={datos.get('COMISARIA','')}"
+                )
 
+                web_interviene = " ".join(filter(None, [datos.get("Juzgado", ""), datos.get("COMISARIA", "")]))
                 fallas = []
-                for col, campo in CAMPOS.items():
-                    val = ws.cell(fila, col).value
-                    if not coincide(val, body, campo):
-                        fallas.append(campo)
+                if not coincide_fecha(ws.cell(fila, COL_FECHA).value, datos.get("Fecha de Labrado", "")):
+                    fallas.append("FECHA")
+                if not coincide_tipo(ws.cell(fila, COL_TIPO).value, datos.get("Tipo Vehículo", "")):
+                    fallas.append("TIPO VEHICULO")
+                if not coincide_marca_modelo(ws.cell(fila, COL_MARCA_MODELO).value, datos.get("Marca", "")):
+                    fallas.append("MARCA/MODELO")
+                if not coincide_color(ws.cell(fila, COL_COLOR).value, datos.get("Color", "")):
+                    fallas.append("COLOR")
+                if not coincide_dominio(ws.cell(fila, COL_DOMINIO).value, datos.get("Dominio", "")):
+                    fallas.append("DOMINIO")
+                if not coincide_interviene(ws.cell(fila, COL_INTERVIENE).value, web_interviene):
+                    fallas.append("INTERVIENE")
 
                 if fallas:
                     ws.cell(fila, COL_OBS).value = "NO COINCIDE: " + ", ".join(fallas)
@@ -338,29 +698,26 @@ class App:
                     verificados += 1
                     self.log("  -> VERIFICADO")
 
-                wb.save(salida)  # guardar progreso tras cada acta
-
-                # Si el detalle navegó a otra pantalla, volver a consulta.
-                if url_antes_detalle:
-                    try:
-                        self.driver.back()
-                        time.sleep(0.8)
-                    except Exception:
-                        pass
+                wb.save(salida)
+                # Reinicia la pantalla antes de la siguiente acta.
+                try:
+                    self.volver_consulta()
+                except Exception:
+                    pass
 
             except Exception as e:
                 errores += 1
                 ws.cell(fila, COL_OBS).value = f"ERROR DE CONSULTA: {str(e)[:120]}"
                 wb.save(salida)
                 self.log(f"  -> ERROR: {e}")
-                # Ante un error de pantalla, no seguir en masa para evitar falsos resultados.
-                if "Nro Acta" in str(e) or "NRO ACTA" in str(e).upper():
-                    break
+                break
 
         wb.save(salida)
         self.set_estado("Proceso finalizado.")
-        resumen = (f"Finalizado. Procesadas: {total} | Verificadas: {verificados} | "
-                   f"Con diferencias: {diferencias} | No encontradas: {no_encontrados} | Errores: {errores}")
+        resumen = (
+            f"Finalizado. Procesadas: {total} | Verificadas: {verificados} | "
+            f"Con diferencias: {diferencias} | No encontradas: {no_encontrados} | Errores: {errores}"
+        )
         self.log(resumen)
         self.log(f"Archivo de salida: {salida}")
         self.root.after(0, lambda: messagebox.showinfo("Verificación finalizada", resumen + f"\n\nSalida:\n{salida}"))
