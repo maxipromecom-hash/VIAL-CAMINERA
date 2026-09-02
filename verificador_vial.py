@@ -17,7 +17,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-VERSION = "3.0"
+VERSION = "4.0"
 URL_LOGIN = "https://sistemas.seguridad.mendoza.gov.ar/vialcaminera//servlet/com.ktksuitelr.mdlsgt.hlogin2"
 URL_CONSULTA_HINT = "wpconsultaantecedentes"
 
@@ -219,29 +219,118 @@ def coincide_interviene(excel, web):
     return presentes / len(ta) >= 0.60
 
 
-def find_input_acta(driver):
-    # Primero: input asociado al texto Nro Acta.
-    etiquetas = driver.find_elements(
-        By.XPATH,
-        "//*[contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyzáéíóúñ','ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÑ'),'NRO ACTA')]"
-    )
-    for et in etiquetas:
-        for xp in ["./following::input[1]", "../following-sibling::*//input[1]", "../input[1]", ".//input[1]"]:
+def find_input_acta(driver, log=None):
+    """Localiza el input REAL de Nro Acta usando proximidad visual al rótulo.
+
+    En este sistema GeneXus hay contenedores cuyo texto completo también contiene
+    "Nro Acta". La v3 podía tomar un input equivocado. Esta versión busca primero
+    elementos hoja con el rótulo y elige el campo de texto visible más cercano,
+    a la derecha y en la misma fila.
+    """
+    def _log(msg):
+        if log:
             try:
-                for inp in et.find_elements(By.XPATH, xp):
-                    if visible(inp) and inp.is_enabled():
-                        return inp
+                log(msg)
             except Exception:
                 pass
 
-    # Fallback por posición: el input visible más cercano al label Nro Acta.
-    inputs = [e for e in driver.find_elements(By.CSS_SELECTOR, "input") if visible(e) and e.is_enabled()]
-    for e in inputs:
-        attrs = " ".join([e.get_attribute("id") or "", e.get_attribute("name") or "", e.get_attribute("placeholder") or ""])
-        if "ACTA" in norm(attrs):
-            return e
-    return None
+    # 1) Reunir inputs de texto visibles y habilitados.
+    inputs = []
+    for e in driver.find_elements(By.CSS_SELECTOR, "input"):
+        try:
+            tipo = (e.get_attribute("type") or "text").lower()
+            if tipo not in {"text", "search", "tel", "number", ""}:
+                continue
+            if not visible(e) or not e.is_enabled():
+                continue
+            r = e.rect
+            if r.get("width", 0) <= 10 or r.get("height", 0) <= 5:
+                continue
+            inputs.append(e)
+        except Exception:
+            pass
 
+    # 2) Buscar rótulos hoja cuyo texto sea exactamente Nro Acta (con o sin ':').
+    labels = []
+    xpath_labels = (
+        "//*[not(*) and string-length(normalize-space(.)) > 0 "
+        "and contains(translate(normalize-space(.),"
+        "'abcdefghijklmnopqrstuvwxyzáéíóúñ','ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÑ'),'NRO ACTA')]"
+    )
+    for et in driver.find_elements(By.XPATH, xpath_labels):
+        try:
+            txt = norm(et.text)
+            if txt in {"NRO ACTA", "NRO ACTA N", "N ACTA", "NUMERO ACTA"} or txt.startswith("NRO ACTA"):
+                if visible(et):
+                    labels.append(et)
+        except Exception:
+            pass
+
+    # 3) Seleccionar por geometría: misma altura y a la derecha del rótulo.
+    mejores = []
+    for lab in labels:
+        try:
+            lr = lab.rect
+            ly = lr.get("y", 0) + lr.get("height", 0) / 2
+            lx_right = lr.get("x", 0) + lr.get("width", 0)
+            for inp in inputs:
+                ir = inp.rect
+                iy = ir.get("y", 0) + ir.get("height", 0) / 2
+                ix = ir.get("x", 0)
+                dy = abs(iy - ly)
+                dx = ix - lx_right
+                # Debe estar aproximadamente en la misma fila y no muy lejos a la izquierda.
+                if dy <= 32 and dx >= -20:
+                    score = dy * 10 + max(dx, 0)
+                    mejores.append((score, inp, lab))
+        except Exception:
+            pass
+
+    if mejores:
+        mejores.sort(key=lambda t: t[0])
+        inp = mejores[0][1]
+        try:
+            _log("  Campo detectado: id='{}' name='{}' x={} y={}".format(
+                inp.get_attribute("id") or "",
+                inp.get_attribute("name") or "",
+                round(inp.rect.get("x", 0), 1),
+                round(inp.rect.get("y", 0), 1),
+            ))
+        except Exception:
+            pass
+        return inp
+
+    # 4) Fallback por atributos GeneXus / nombre del control.
+    candidatos = []
+    for e in inputs:
+        try:
+            attrs = " ".join([
+                e.get_attribute("id") or "",
+                e.get_attribute("name") or "",
+                e.get_attribute("placeholder") or "",
+                e.get_attribute("title") or "",
+            ])
+            na = norm(attrs)
+            if "ACTA" in na and "DOCUMENT" not in na:
+                candidatos.append(e)
+        except Exception:
+            pass
+    if candidatos:
+        return candidatos[0]
+
+    # 5) Último fallback: en la pantalla conocida, Nro Acta es el input de texto
+    # de la columna izquierda que está debajo de Nro Documento. Elegimos por Y.
+    if len(inputs) >= 2:
+        try:
+            # Agrupar por mitad izquierda de la pantalla y ordenar verticalmente.
+            ancho = driver.execute_script("return window.innerWidth || document.documentElement.clientWidth") or 1400
+            izquierdos = [e for e in inputs if e.rect.get("x", 0) < ancho * 0.55]
+            izquierdos.sort(key=lambda e: e.rect.get("y", 0))
+            if len(izquierdos) >= 2:
+                return izquierdos[-1]
+        except Exception:
+            pass
+    return None
 
 def click_buscar(driver):
     xpaths = [
@@ -585,14 +674,14 @@ class App:
 
     def consultar_acta(self, acta):
         self.volver_consulta()
-        inp = find_input_acta(self.driver)
+        inp = find_input_acta(self.driver, self.log)
         if not inp:
             raise RuntimeError("No encontré el campo Nro Acta.")
         # v3: escritura real + eventos del formulario. El sistema GeneXus no siempre
         # acepta un valor si sólo se asigna mediante JavaScript/Selenium.
         cargado = False
         for intento in range(1, 4):
-            inp = find_input_acta(self.driver)
+            inp = find_input_acta(self.driver, self.log)
             if not inp:
                 return None, "NO SE ENCONTRO CAMPO NRO ACTA"
             try:
@@ -608,6 +697,27 @@ class App:
                 time.sleep(0.35)
                 valor = (inp.get_attribute("value") or "").strip()
                 self.log(f"  Campo Nro Acta intento {intento}: '{valor}'")
+
+                # Si send_keys no dejó el valor, usar el setter nativo del input y
+                # disparar los eventos que GeneXus suele escuchar.
+                if compact(valor) != compact(acta):
+                    try:
+                        self.driver.execute_script(
+                            """
+                            const el = arguments[0], val = arguments[1];
+                            const proto = Object.getPrototypeOf(el);
+                            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                            if (desc && desc.set) desc.set.call(el, val); else el.value = val;
+                            ['input','change','keyup','blur'].forEach(t =>
+                                el.dispatchEvent(new Event(t, {bubbles:true})));
+                            """, inp, str(acta)
+                        )
+                        time.sleep(0.25)
+                        valor = (inp.get_attribute("value") or "").strip()
+                        self.log(f"  Campo Nro Acta tras eventos JS: '{valor}'")
+                    except Exception as ex:
+                        self.log(f"  Fallback JS no pudo cargar el acta: {ex}")
+
                 if compact(valor) == compact(acta):
                     cargado = True
                     break
@@ -615,6 +725,16 @@ class App:
                 self.log(f"  Reintento de carga del acta: {ex}")
             time.sleep(0.5)
         if not cargado:
+            try:
+                self.log("  Diagnóstico de inputs visibles:")
+                for i, e in enumerate(self.driver.find_elements(By.CSS_SELECTOR, "input"), 1):
+                    if visible(e):
+                        self.log("    #{} type={} id='{}' name='{}' value='{}' x={} y={}".format(
+                            i, e.get_attribute("type") or "", e.get_attribute("id") or "",
+                            e.get_attribute("name") or "", e.get_attribute("value") or "",
+                            round(e.rect.get("x", 0), 1), round(e.rect.get("y", 0), 1)))
+            except Exception:
+                pass
             return None, "EL SISTEMA NO ACEPTO EL NRO ACTA"
 
         if not click_buscar(self.driver):
