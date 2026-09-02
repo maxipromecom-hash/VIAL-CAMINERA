@@ -17,7 +17,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-VERSION = "2.0"
+VERSION = "3.0"
 URL_LOGIN = "https://sistemas.seguridad.mendoza.gov.ar/vialcaminera//servlet/com.ktksuitelr.mdlsgt.hlogin2"
 URL_CONSULTA_HINT = "wpconsultaantecedentes"
 
@@ -588,15 +588,49 @@ class App:
         inp = find_input_acta(self.driver)
         if not inp:
             raise RuntimeError("No encontré el campo Nro Acta.")
-        inp.click()
-        inp.send_keys(Keys.CONTROL, "a")
-        inp.send_keys(Keys.BACKSPACE)
-        inp.send_keys(acta)
+        # v3: escritura real + eventos del formulario. El sistema GeneXus no siempre
+        # acepta un valor si sólo se asigna mediante JavaScript/Selenium.
+        cargado = False
+        for intento in range(1, 4):
+            inp = find_input_acta(self.driver)
+            if not inp:
+                return None, "NO SE ENCONTRO CAMPO NRO ACTA"
+            try:
+                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
+                inp.click()
+                inp.send_keys(Keys.CONTROL, "a")
+                inp.send_keys(Keys.BACKSPACE)
+                # escribir carácter por carácter para simular teclado humano
+                for ch in str(acta):
+                    inp.send_keys(ch)
+                    time.sleep(0.04)
+                inp.send_keys(Keys.TAB)
+                time.sleep(0.35)
+                valor = (inp.get_attribute("value") or "").strip()
+                self.log(f"  Campo Nro Acta intento {intento}: '{valor}'")
+                if compact(valor) == compact(acta):
+                    cargado = True
+                    break
+            except Exception as ex:
+                self.log(f"  Reintento de carga del acta: {ex}")
+            time.sleep(0.5)
+        if not cargado:
+            return None, "EL SISTEMA NO ACEPTO EL NRO ACTA"
+
         if not click_buscar(self.driver):
             inp.send_keys(Keys.ENTER)
+        time.sleep(0.5)
 
-        acta_el = esperar_resultado_acta(self.driver, acta, timeout=10)
+        # Si el sistema muestra el aviso de campo vacío, NO marcar como no encontrada.
+        texto_pagina = norm(self.driver.find_element(By.TAG_NAME, "body").text)
+        if "DEBE CARGAR EL N" in texto_pagina and "ACTA" in texto_pagina and "DOMINIO" in texto_pagina:
+            return None, "CONSULTA RECHAZADA: EL SISTEMA TOMO NRO ACTA VACIO"
+
+        acta_el = esperar_resultado_acta(self.driver, acta, timeout=12)
         if not acta_el:
+            texto_pagina = norm(self.driver.find_element(By.TAG_NAME, "body").text)
+            if "DEBE CARGAR EL N" in texto_pagina and "ACTA" in texto_pagina:
+                return None, "CONSULTA RECHAZADA: EL SISTEMA TOMO NRO ACTA VACIO"
             return None, "NO ENCONTRADA"
 
         if not click_tres_puntos(self.driver, acta_el):
