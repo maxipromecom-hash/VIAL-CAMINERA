@@ -20,7 +20,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-VERSION = "8.0"
+VERSION = "9.0"
 URL_LOGIN = "https://sistemas.seguridad.mendoza.gov.ar/vialcaminera//servlet/com.ktksuitelr.mdlsgt.hlogin2"
 URL_CONSULTA_HINT = "wpconsultaantecedentes"
 
@@ -765,8 +765,39 @@ def click_lupa(driver, acta=None, log=None):
 
     return None if acta else False
 
+def _recortar_bloque_datos_descriptivos(texto, acta=""):
+    """Devuelve SOLO el bloque del modal final.
+
+    GeneXus deja visible en el DOM el formulario de Consulta de Antecedentes detrás
+    del modal. En v8 se leía el body completo y por eso podían capturarse valores
+    como Tipo Vehículo=Todos (filtro de búsqueda) para todas las actas.
+    """
+    texto = str(texto or "")
+    lineas = [x.rstrip() for x in texto.splitlines()]
+    # Usar la ÚLTIMA aparición del título: el modal final suele estar al final del DOM.
+    indices = [i for i, x in enumerate(lineas) if "OBJETOS DATOS DESCRIPTIVOS" in norm(x)]
+    if indices:
+        lineas = lineas[indices[-1]:]
+    bloque = "\n".join(lineas).strip()
+
+    # Si hubiera más de un bloque por ventanas anteriores, conservar el que contiene el acta actual.
+    if acta and compact(acta) not in compact(bloque):
+        # Buscar desde la última aparición del acta hacia atrás hasta el título más cercano.
+        inds_acta = [i for i, x in enumerate(texto.splitlines()) if compact(acta) in compact(x)]
+        if inds_acta:
+            all_lines = texto.splitlines()
+            ia = inds_acta[-1]
+            inicio = 0
+            for i in range(ia, -1, -1):
+                if "OBJETOS DATOS DESCRIPTIVOS" in norm(all_lines[i]):
+                    inicio = i
+                    break
+            bloque = "\n".join(all_lines[inicio:]).strip()
+    return bloque
+
+
 def esperar_datos_descriptivos(driver, acta, timeout=10):
-    """Espera la ventana final y la localiza aunque aparezca en otro iframe."""
+    """Espera el modal final y retorna solamente SU contenido, no el body completo."""
     fin = time.time() + timeout
     while time.time() < fin:
         try:
@@ -776,34 +807,44 @@ def esperar_datos_descriptivos(driver, acta, timeout=10):
 
         encontrado = _buscar_contexto_con_texto(driver, ["OBJETOS DATOS DESCRIPTIVOS"])
         if encontrado:
-            texto = _texto_contexto_actual(driver)
-            nt = norm(texto)
-            if compact(acta) in compact(texto) and "TIPO VEHICULO" in nt and "DOMINIO" in nt:
-                return texto
+            texto_completo = _texto_contexto_actual(driver)
+            bloque = _recortar_bloque_datos_descriptivos(texto_completo, acta)
+            nt = norm(bloque)
+            if compact(acta) in compact(bloque) and "TIPO VEHICULO" in nt and "DOMINIO" in nt:
+                return bloque
         time.sleep(0.25)
     return None
 
 
 def extraer_campo(texto, etiqueta, siguientes):
-    """Extrae un valor por líneas. Funciona con el innerText de la ventana del sistema."""
+    """Extrae la ÚLTIMA ocurrencia válida de una etiqueta dentro del modal final."""
     lines = [re.sub(r"\s+", " ", x).strip() for x in str(texto or "").splitlines() if x.strip()]
     et = norm(etiqueta)
     sigs = {norm(s) for s in siguientes}
+    invalidos = {"TODOS", "TODAS", "SELECCIONE", "SELECCIONAR", "--", "-"}
+    candidatos = []
+
     for i, line in enumerate(lines):
         nl = norm(line)
-        # Etiqueta y valor en la misma línea.
         if nl == et or nl.startswith(et + " "):
-            resto = line[len(line.split()[0]):].strip() if False else ""
-            # Si el texto está en una sola línea, sacar lo que siga a la etiqueta original.
+            # etiqueta + valor en la misma línea
             m = re.match(rf"(?i)^\s*{re.escape(etiqueta)}\s*[:\-]?\s*(.+)$", line)
-            if m and m.group(1).strip():
-                return m.group(1).strip()
-            # En GeneXus normalmente el valor queda en la línea siguiente.
-            for j in range(i + 1, min(len(lines), i + 4)):
-                if norm(lines[j]) in sigs:
+            if m:
+                val = m.group(1).strip()
+                if val and norm(val) not in invalidos and norm(val) != et:
+                    candidatos.append(val)
+                    continue
+            # etiqueta y valor en línea siguiente; saltar líneas vacías/etiquetas
+            for j in range(i + 1, min(len(lines), i + 6)):
+                nv = norm(lines[j])
+                if nv in sigs:
                     break
-                return lines[j]
-    return ""
+                if not nv or nv in invalidos:
+                    continue
+                candidatos.append(lines[j])
+                break
+
+    return candidatos[-1] if candidatos else ""
 
 
 def extraer_datos(texto):
@@ -831,9 +872,14 @@ def extraer_datos(texto):
     }
     for k, pat in patrones.items():
         if not datos.get(k):
-            m = re.search(pat, texto or "")
-            if m:
-                datos[k] = m.group(1).strip()
+            ms = list(re.finditer(pat, texto or ""))
+            if ms:
+                datos[k] = ms[-1].group(1).strip()
+
+    # Nunca aceptar valores propios de los filtros de la pantalla principal.
+    for k in ("Tipo Vehículo", "Marca", "Color", "Modelo", "Dominio"):
+        if norm(datos.get(k, "")) in {"TODOS", "TODAS", "SELECCIONE", "SELECCIONAR"}:
+            datos[k] = ""
     return datos
 
 
@@ -1105,7 +1151,7 @@ class App:
                     continue
 
                 self.log(
-                    "  Sistema: "
+                    "  Sistema (modal final): "
                     f"Fecha={datos.get('Fecha de Labrado','')} | "
                     f"Tipo={datos.get('Tipo Vehículo','')} | "
                     f"Dominio={datos.get('Dominio','')} | "
