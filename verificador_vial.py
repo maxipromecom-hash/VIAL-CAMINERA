@@ -20,22 +20,13 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-VERSION = "12.0"
+VERSION = "14.0"
 URL_LOGIN = "https://sistemas.seguridad.mendoza.gov.ar/vialcaminera//servlet/com.ktksuitelr.mdlsgt.hlogin2"
 URL_CONSULTA_HINT = "wpconsultaantecedentes"
 
-# Estructura de la planilla Playa San Ignacio de Loyola
-HEADER_ROW = 3
-COL_FECHA = 2          # B
-COL_TIPO = 3           # C
-COL_MARCA_MODELO = 4   # D
-COL_COLOR = 5          # E
-COL_DOMINIO = 6        # F
-COL_INTERVIENE = 10    # J
-COL_SUMARIO = 11       # K
-COL_OBS = 13           # M
-
-# Por decisión del usuario NO se comparan Motor ni Chasis.
+# v13 UNIVERSAL: la estructura del Excel se detecta automáticamente.
+# Ya no dependemos de posiciones fijas de columnas ni de una hoja específica.
+# Por decisión del usuario NO se comparan Fecha, Motor ni Chasis.
 CAMPOS_COMPARADOS = ("DOMINIO↔ACTA", "MARCA/MODELO", "COLOR")
 
 
@@ -189,36 +180,263 @@ def dominio_sin_chapa(v):
 def extraer_dominio_real(v):
     """Devuelve una patente utilizable para búsqueda o None si realmente no hay dominio.
 
-    Soporta formatos directos (ABC123, 123ABC, AA123AA, A123ABC) y casos
-    como 'S/CHAPA (A032JLX)' o 'S/DOMINIO (537KEO)'. Quita guiones/espacios.
+    Conserva la letra inicial de dominios Mercosur de motos (ej. A073JXE) y
+    soporta formatos con guiones/espacios y observaciones como
+    'S/CHAPA (A032JLX)' o 'S/DOMINIO (537KEO)'.
     """
     raw = str(v or "").upper()
-    limpio = re.sub(r"[^A-Z0-9]", "", raw)
 
+    # Buscar sobre el texto original, permitiendo sólo espacios/guiones DENTRO
+    # del dominio. No compactamos toda la frase antes de buscar porque eso puede
+    # unir letras de palabras como "S/CHAPA" con la patente entre paréntesis.
     patrones = [
-        r"[A-Z]{2}\d{3}[A-Z]{2}",   # Mercosur auto: AA123AA
-        r"[A-Z]\d{3}[A-Z]{3}",     # Mercosur moto: A123ABC
-        r"[A-Z]{3}\d{3}",          # viejo auto: ABC123
-        r"\d{3}[A-Z]{3}",          # viejo moto: 123ABC
+        r"(?<![A-Z0-9])[A-Z]{2}[\s-]*\d{3}[\s-]*[A-Z]{2}(?![A-Z0-9])",  # AA123AA
+        r"(?<![A-Z0-9])[A-Z][\s-]*\d{3}[\s-]*[A-Z]{3}(?![A-Z0-9])",   # A123ABC
+        r"(?<![A-Z0-9])[A-Z]{3}[\s-]*\d{3}(?![A-Z0-9])",               # ABC123
+        r"(?<![A-Z0-9])\d{3}[\s-]*[A-Z]{3}(?![A-Z0-9])",               # 123ABC
     ]
 
-    # Primero buscar dentro del texto original compactado por segmentos, para no
-    # confundir palabras como SIN DOMINIO con una patente.
-    candidatos=[]
-    for p in patrones:
-        candidatos += re.findall(p, limpio)
-    if candidatos:
-        return candidatos[-1]
+    for patron in patrones:
+        m = re.search(patron, raw)
+        if m:
+            return re.sub(r"[^A-Z0-9]", "", m.group(0))
 
-    # Si no apareció un patrón real, los textos de ausencia de chapa no aplican.
     if dominio_sin_chapa(v) or any(x in norm(v) for x in ("S DOMINIO", "S CHAPA", "SIN DOMINIO", "SIN CHAPA")):
         return None
     return None
 
 
+
+# ---------------- v14: DETECCIÓN UNIVERSAL DE PLANILLAS ----------------
+COLORES_BASE = {
+    "NEGRO", "BLANCO", "ROJO", "GRIS", "AZUL", "VERDE", "AMARILLO",
+    "BORDO", "BORDEAUX", "NARANJA", "CELESTE", "MARRON", "BEIGE",
+    "VIOLETA", "DORADO", "PLATEADO", "CREMA"
+}
+TIPOS_BASE = {
+    "MOTO", "MOTOCICLETA", "MOTOVEHICULO", "AUTO", "AUTOMOVIL", "AUTOMOTOR",
+    "CAMIONETA", "CAMION", "BICIMOTO", "CUATRICICLO", "TRAILER", "ACOPLADO"
+}
+
+
+def _header(v):
+    return norm(v)
+
+
+def _parece_color(v):
+    n = normalizar_color(v)
+    if not n:
+        return False
+    toks = set(n.split())
+    return bool(toks & COLORES_BASE)
+
+
+def _parece_tipo(v):
+    return norm(v) in TIPOS_BASE or normalizar_tipo(v) in {"MOTOCICLETA", "AUTOMOVIL", "CAMIONETA", "CAMION", "BICIMOTO"}
+
+
+def _parece_marca_modelo(v):
+    n = norm(v)
+    if not n or len(n) < 3:
+        return False
+    if _parece_color(v) or _parece_tipo(v) or extraer_dominio_real(v):
+        return False
+    # Texto típico de marca/modelo: letras y opcionalmente cilindrada/modelo.
+    return bool(re.search(r"[A-Z]{3,}", n))
+
+
+def extraer_acta_vial(valor):
+    """Extrae el identificador vial útil desde formatos heterogéneos.
+
+    Ejemplos:
+      ACTA L2401794 -> L2401794
+      L0002301916 -> L0002301916
+      SUM 163/19 ACTA X5300401 -> X5300401
+      4300411 (San Cristóbal) -> L4300411
+    Un SUMARIO/EXPTE sin identificador vial explícito devuelve None.
+    """
+    if valor is None:
+        return None
+    # Números puros de la columna EXTE-ACTA VIAL de San Cristóbal.
+    if isinstance(valor, (int, float)) and not isinstance(valor, bool):
+        try:
+            if float(valor).is_integer():
+                dig = str(int(valor))
+                if 6 <= len(dig) <= 12:
+                    return "L" + dig
+        except Exception:
+            pass
+    raw = str(valor).upper().strip()
+    if not raw or norm(raw) in {"NO CONSTA", "SIN DATOS", "S D", "SD", "NINGUNO"}:
+        return None
+    # Identificador vial explícito L/X + números, aun si está dentro de una frase.
+    m = re.search(r"\b([LX])\s*[- ]?\s*(\d{6,12})\b", raw)
+    if m:
+        return m.group(1) + m.group(2)
+    # Cualquier letra + 6 o más dígitos si viene precedido por ACTA.
+    m = re.search(r"\bACTA\s*[:\-]?\s*([A-Z])\s*[- ]?\s*(\d{6,12})\b", raw)
+    if m:
+        return m.group(1) + m.group(2)
+    # Una celda que sea sólo dígitos se interpreta como acta L (caso San Cristóbal).
+    m = re.fullmatch(r"\s*(\d{6,12})\s*", raw)
+    if m:
+        return "L" + m.group(1)
+    return None
+
+
+def _score_header_row(ws, fila):
+    score = 0
+    encontrados = set()
+    for c in range(1, ws.max_column + 1):
+        h = _header(ws.cell(fila, c).value)
+        if not h:
+            continue
+        if h == "TIPO" or "TIPO VEHIC" in h: encontrados.add("tipo")
+        if "MARCA" in h and "MODELO" in h: encontrados.add("marca")
+        if "COLOR" in h: encontrados.add("color")
+        if "DOMINIO" in h or "PATENTE" in h: encontrados.add("dominio")
+        if "ACTA" in h or "SUMARIO" in h or ("EXTE" in h and "VIAL" in h): encontrados.add("acta")
+        if h in {"OBS", "OBSERVACIONES", "VERIFICACION VIAL"}: encontrados.add("obs")
+        if "INTERVIENE" in h or "INTERVINIENTE" in h: encontrados.add("interviene")
+        if "FECHA" in h: encontrados.add("fecha")
+        if "DEPENDENCIA" in h: encontrados.add("dependencia")
+        if "INGRESO" in h or "REG INTERNO" in h: encontrados.add("registro")
+    # Los cinco campos básicos pesan más; extras ayudan a elegir entre hojas duplicadas.
+    score = sum(3 if x in encontrados else 0 for x in ("tipo", "marca", "color", "dominio", "acta"))
+    score += sum(1 for x in encontrados if x not in {"tipo", "marca", "color", "dominio", "acta"})
+    return score, encontrados
+
+
+def _sample_values(ws, header_row, col, max_n=90):
+    vals=[]
+    fin=min(ws.max_row, header_row + max_n)
+    for r in range(header_row + 1, fin + 1):
+        v=ws.cell(r,col).value
+        if v is not None and str(v).strip():
+            vals.append(v)
+    return vals
+
+
+def _ratio(vals, pred):
+    if not vals:
+        return 0.0
+    ok=0
+    for v in vals:
+        try:
+            if pred(v): ok += 1
+        except Exception:
+            pass
+    return ok / max(1, len(vals))
+
+
+def _choose_semantic_col(ws, header_row, semantic):
+    best=None
+    for c in range(1, ws.max_column + 1):
+        h=_header(ws.cell(header_row,c).value)
+        vals=_sample_values(ws,header_row,c)
+        hb=0.0
+        data=0.0
+        if semantic == "dominio":
+            hb = 2.5 if ("DOMINIO" in h or "PATENTE" in h) else 0.0
+            data = _ratio(vals, lambda v: bool(extraer_dominio_real(v)) or dominio_sin_chapa(v) or "S DOMINIO" in norm(v)) * 10
+        elif semantic == "color":
+            hb = 2.5 if "COLOR" in h else 0.0
+            data = _ratio(vals, _parece_color) * 10
+        elif semantic == "tipo":
+            hb = 4.0 if (h == "TIPO" or "TIPO VEHIC" in h) else 0.0
+            data = _ratio(vals, _parece_tipo) * 8
+        elif semantic == "marca_modelo":
+            hb = 8.0 if ("MARCA" in h and "MODELO" in h) else 0.0
+            data = _ratio(vals, _parece_marca_modelo) * 2
+        elif semantic == "acta":
+            hb = 8.0 if ("ACTA" in h or "SUMARIO" in h or ("EXTE" in h and "VIAL" in h)) else 0.0
+            data = _ratio(vals, lambda v: extraer_acta_vial(v) is not None) * 4
+        elif semantic == "interviene":
+            hb = 6.0 if ("INTERVIENE" in h or "INTERVINIENTE" in h) else 0.0
+            data = 0.0
+        score=hb+data
+        if best is None or score > best[0]:
+            best=(score,c,h)
+    return best[1] if best and best[0] >= 2.0 else None
+
+
+def detectar_estructura_excel(wb):
+    """Selecciona automáticamente hoja, fila de encabezados y columnas útiles."""
+    candidatos=[]
+    for ws in wb.worksheets:
+        max_head=min(12, ws.max_row)
+        for r in range(1,max_head+1):
+            score, encontrados=_score_header_row(ws,r)
+            if score >= 10:
+                # Una hoja más completa y con más filas gana en caso de empate.
+                candidatos.append((score, len(encontrados), min(ws.max_row,1000), ws, r))
+    if not candidatos:
+        raise RuntimeError("No pude detectar una tabla con TIPO, MARCA/MODELO, COLOR, DOMINIO y ACTA/SUMARIO.")
+    candidatos.sort(key=lambda x:(x[0],x[1],x[2]), reverse=True)
+    _,_,_,ws,header_row=candidatos[0]
+
+    cfg={
+        "sheet": ws,
+        "sheet_name": ws.title,
+        "header_row": header_row,
+        "tipo": _choose_semantic_col(ws,header_row,"tipo"),
+        "marca_modelo": _choose_semantic_col(ws,header_row,"marca_modelo"),
+        "color": _choose_semantic_col(ws,header_row,"color"),
+        "dominio": _choose_semantic_col(ws,header_row,"dominio"),
+        "acta": _choose_semantic_col(ws,header_row,"acta"),
+        "interviene": _choose_semantic_col(ws,header_row,"interviene"),
+    }
+    if not all(cfg.get(k) for k in ("marca_modelo","color","dominio","acta")):
+        raise RuntimeError("Detecté la hoja, pero faltan columnas esenciales (Marca/Modelo, Color, Dominio o Acta).")
+
+    # Usar una columna dedicada si ya existe. OBS simple puede contener datos operativos,
+    # por eso NO se pisa; se crea VERIFICACION VIAL al final.
+    col_ver=None
+    for c in range(1,ws.max_column+1):
+        h=_header(ws.cell(header_row,c).value)
+        if h in {"VERIFICACION VIAL", "OBSERVACIONES"}:
+            col_ver=c
+            break
+    if col_ver is None:
+        col_ver=ws.max_column+1
+        ws.cell(header_row,col_ver).value="VERIFICACION VIAL"
+        try:
+            from copy import copy
+            src=ws.cell(header_row,max(1,col_ver-1))
+            dst=ws.cell(header_row,col_ver)
+            if src.has_style:
+                dst._style=copy(src._style)
+                dst.font=copy(src.font); dst.fill=copy(src.fill); dst.border=copy(src.border)
+                dst.alignment=copy(src.alignment); dst.number_format=src.number_format
+        except Exception:
+            pass
+        try:
+            ws.column_dimensions[ws.cell(header_row,col_ver).column_letter].width=30
+        except Exception:
+            pass
+    cfg["verificacion"]=col_ver
+    return cfg
+
+
+def extraer_acta_de_fila(ws, fila, cfg):
+    """Usa la columna detectada y, si hace falta, busca un L/X######## en toda la fila."""
+    raw=ws.cell(fila,cfg["acta"]).value if cfg.get("acta") else None
+    acta=extraer_acta_vial(raw)
+    if acta:
+        return acta, raw
+    # Valle de Uco puede tener NO CONSTA en SUMARIO pero un QRU L... en OBS.
+    for c in range(1,ws.max_column+1):
+        v=ws.cell(fila,c).value
+        if v is None: continue
+        m=re.search(r"\b([LX])\s*[- ]?\s*(\d{6,12})\b", str(v).upper())
+        if m:
+            return m.group(1)+m.group(2), raw
+    return None, raw
+
+
 def es_acta_vial(acta):
-    """Las actas del sistema vial que venimos verificando comienzan con L + dígitos."""
-    return bool(re.fullmatch(r"L\d+", compact(acta)))
+    """Identificador vial explícito utilizable en la consulta."""
+    return bool(re.fullmatch(r"[LX]\d{6,12}", compact(acta)))
 
 
 def extraer_info_objeto_simple(driver):
@@ -1138,7 +1356,7 @@ class App:
 
     def _ui(self):
         tk.Label(self.root, text="VERIFICADOR VIAL CAMINERA", font=("Segoe UI", 18, "bold")).pack(pady=(15, 3))
-        tk.Label(self.root, text=f"Versión {VERSION} · Verificación simplificada: DOMINIO↔ACTA tiene prioridad; sin dominio compara MARCA/MODELO y COLOR.", font=("Segoe UI", 10)).pack(pady=(0, 4))
+        tk.Label(self.root, text=f"Versión {VERSION} UNIVERSAL · Detecta hoja/columnas automáticamente. DOMINIO↔ACTA tiene prioridad; sin dominio compara MARCA/MODELO y COLOR.", font=("Segoe UI", 10)).pack(pady=(0, 4))
         tk.Label(self.root, text="No guarda usuario ni contraseña. La sesión se inicia manualmente en Chrome.", font=("Segoe UI", 9)).pack(pady=(0, 12))
 
         f = tk.Frame(self.root)
@@ -1305,59 +1523,102 @@ class App:
         self.log(f"Respaldo creado: {os.path.basename(respaldo)}")
 
         wb=load_workbook(p)
-        ws=wb.active
+        try:
+            cfg=detectar_estructura_excel(wb)
+        except Exception as e:
+            self.log(f"ERROR DETECTANDO ESTRUCTURA: {e}")
+            self.root.after(0,lambda: messagebox.showerror("Estructura Excel", str(e)))
+            return
+        ws=cfg["sheet"]
         total=verificados=diferencias=no_encontrados=errores=0
 
-        for fila in range(HEADER_ROW+1, ws.max_row+1):
-            if self.stop_flag: break
-            acta=ws.cell(fila,COL_SUMARIO).value
-            obs=str(ws.cell(fila,COL_OBS).value or "").strip().upper()
-            if not acta: continue
-            if self.solo_pendientes.get() and "VERIFICADO" in obs: continue
-            if limite and total>=limite: break
+        def colname(n):
+            try: return ws.cell(cfg["header_row"],n).column_letter
+            except Exception: return "?"
+        self.log(
+            f"Estructura detectada: hoja='{cfg['sheet_name']}' | encabezados fila {cfg['header_row']} | "
+            f"Tipo={colname(cfg.get('tipo')) if cfg.get('tipo') else '-'} | "
+            f"Marca/Modelo={colname(cfg['marca_modelo'])} | Color={colname(cfg['color'])} | "
+            f"Dominio={colname(cfg['dominio'])} | Acta={colname(cfg['acta'])} | "
+            f"Verificación={colname(cfg['verificacion'])}"
+        )
+        # Avisar si COLOR/DOMINIO quedaron intercambiados respecto del rótulo: ocurre en San Cristóbal.
+        h_color=norm(ws.cell(cfg['header_row'],cfg['color']).value)
+        h_dom=norm(ws.cell(cfg['header_row'],cfg['dominio']).value)
+        if "DOMINIO" in h_color or "COLOR" in h_dom:
+            self.log("  -> Se detectó encabezado COLOR/DOMINIO desplazado; se usarán los datos reales de las columnas.")
 
-            total+=1
-            acta=str(acta).strip()
-            dominio_excel=ws.cell(fila,COL_DOMINIO).value
+        for fila in range(cfg["header_row"]+1, ws.max_row+1):
+            if self.stop_flag: break
+            obs=str(ws.cell(fila,cfg["verificacion"]).value or "").strip().upper()
+            if self.solo_pendientes.get() and "VERIFICADO" in obs:
+                continue
+
+            acta, acta_original = extraer_acta_de_fila(ws,fila,cfg)
+            dominio_excel=ws.cell(fila,cfg["dominio"]).value
             dominio_real=extraer_dominio_real(dominio_excel)
-            self.set_estado(f"Fila {fila} · Acta {acta}")
-            self.log(f"Consultando fila {fila} - Acta {acta}...")
+            marca_excel=ws.cell(fila,cfg["marca_modelo"]).value
+            color_excel=ws.cell(fila,cfg["color"]).value
+
+            # Ignorar filas totalmente vacías / títulos / separadores.
+            if not any(str(x or "").strip() for x in (acta_original,dominio_excel,marca_excel,color_excel)):
+                continue
+            if limite and total>=limite: break
+            total+=1
+
+            referencia=acta or str(acta_original or "SIN ACTA VIAL").strip()
+            self.set_estado(f"Fila {fila} · {referencia}")
+            self.log(f"Consultando fila {fila} - Acta {referencia}...")
+            if acta and acta_original is not None and compact(str(acta_original)) != compact(acta):
+                self.log(f"  Acta normalizada: '{acta_original}' -> '{acta}'")
+            self.log(f"  Excel detectado: Marca/Modelo={marca_excel or ''} | Color={color_excel or ''} | Dominio={dominio_excel or ''}")
 
             try:
-                # REGLA 1 (prioritaria y rápida): si existe patente real, sólo necesitamos
-                # demostrar que al buscarla aparece exactamente el acta de esta fila.
+                # REGLA 1: CON DOMINIO REAL, el cruce DOMINIO -> ACTA es la prueba principal.
                 if dominio_real:
+                    if not acta:
+                        ws.cell(fila,cfg["verificacion"]).value="NO VERIFICABLE: DOMINIO PRESENTE PERO SIN ACTA VIAL EN EXCEL"
+                        no_encontrados+=1
+                        self.log(f"  -> Dominio real {dominio_real}, pero no hay Acta Vial utilizable en la fila")
+                        wb.save(salida)
+                        continue
                     cruce_ok,cruce_error=self.consultar_dominio_contiene_acta(str(dominio_excel or ''),acta)
                     if cruce_error:
-                        ws.cell(fila,COL_OBS).value=f"ERROR VERIFICANDO DOMINIO: {cruce_error}"
+                        ws.cell(fila,cfg["verificacion"]).value=f"ERROR VERIFICANDO DOMINIO: {cruce_error}"
                         errores+=1
                         self.log(f"  -> {cruce_error}")
                     elif cruce_ok:
-                        ws.cell(fila,COL_OBS).value="VERIFICADO POR DOMINIO"
+                        ws.cell(fila,cfg["verificacion"]).value="VERIFICADO POR DOMINIO"
                         verificados+=1
-                        self.log("  -> VERIFICADO POR DOMINIO")
+                        self.log(f"  -> VERIFICADO POR DOMINIO ({dominio_real} ↔ {acta})")
                     else:
-                        ws.cell(fila,COL_OBS).value="NO COINCIDE: DOMINIO NO ASOCIA ACTA"
+                        ws.cell(fila,cfg["verificacion"]).value="NO COINCIDE: DOMINIO NO ASOCIA ACTA"
                         diferencias+=1
-                        self.log("  -> DOMINIO NO ASOCIA EL ACTA")
+                        self.log(f"  -> DOMINIO {dominio_real} NO ASOCIA EL ACTA {acta}")
                     wb.save(salida)
                     continue
 
-                # REGLA 2: sin patente real, usar acta + Información de Objeto.
-                # No usamos Tipo Vehículo ni la lupa; sólo Marca/Modelo y Color.
+                # REGLA 2: SIN DOMINIO REAL, necesitamos Acta Vial + Información de Objeto.
+                if not acta:
+                    ws.cell(fila,cfg["verificacion"]).value="NO VERIFICABLE: SIN DOMINIO NI ACTA VIAL"
+                    no_encontrados+=1
+                    self.log("  -> NO VERIFICABLE: SIN DOMINIO NI ACTA VIAL")
+                    wb.save(salida)
+                    continue
+
                 datos,problema=self.consultar_acta(acta)
                 if problema:
                     if problema=="NO ENCONTRADA":
                         if es_acta_vial(acta):
-                            ws.cell(fila,COL_OBS).value="NO ENCONTRADA EN SISTEMA VIAL"
+                            ws.cell(fila,cfg["verificacion"]).value="NO ENCONTRADA EN SISTEMA VIAL"
                             no_encontrados+=1
                             self.log("  -> NO ENCONTRADA EN SISTEMA VIAL")
                         else:
-                            ws.cell(fila,COL_OBS).value="NO VERIFICABLE POR ACTA VIAL"
+                            ws.cell(fila,cfg["verificacion"]).value="NO VERIFICABLE POR ACTA VIAL"
                             no_encontrados+=1
                             self.log("  -> NO VERIFICABLE POR ACTA VIAL")
                     else:
-                        ws.cell(fila,COL_OBS).value=f"ERROR DE NAVEGACION: {problema}"
+                        ws.cell(fila,cfg["verificacion"]).value=f"ERROR DE NAVEGACION: {problema}"
                         errores+=1
                         self.log(f"  -> {problema}")
                     wb.save(salida)
@@ -1365,13 +1626,10 @@ class App:
 
                 marca_web=combinar_marca_modelo(datos or {})
                 color_web=(datos or {}).get("Color","")
-                marca_excel=ws.cell(fila,COL_MARCA_MODELO).value
-                color_excel=ws.cell(fila,COL_COLOR).value
                 self.log(f"  Información de Objeto: Marca/Modelo={marca_web} | Color={color_web}")
-                self.log(f"  Excel: Marca/Modelo={marca_excel or ''} | Color={color_excel or ''} | Dominio={dominio_excel or ''}")
 
                 if not marca_web and not color_web:
-                    ws.cell(fila,COL_OBS).value="DATOS DE OBJETO NO LEIDOS"
+                    ws.cell(fila,cfg["verificacion"]).value="DATOS DE OBJETO NO LEIDOS"
                     errores+=1
                     self.log("  -> DATOS DE OBJETO NO LEIDOS")
                 else:
@@ -1379,24 +1637,24 @@ class App:
                     if not coincide_marca_modelo(marca_excel, marca_web): fallas.append("MARCA/MODELO")
                     if not coincide_color(color_excel, color_web): fallas.append("COLOR")
                     if not fallas:
-                        ws.cell(fila,COL_OBS).value="VERIFICADO SIN DOMINIO"
+                        ws.cell(fila,cfg["verificacion"]).value="VERIFICADO SIN DOMINIO"
                         verificados+=1
                         self.log("  -> VERIFICADO SIN DOMINIO")
                     else:
-                        ws.cell(fila,COL_OBS).value="NO COINCIDE: "+", ".join(fallas)
+                        ws.cell(fila,cfg["verificacion"]).value="NO COINCIDE: "+", ".join(fallas)
                         diferencias+=1
                         self.log("  -> DIFERENCIAS: "+", ".join(fallas))
                 wb.save(salida)
 
             except Exception as e:
                 errores+=1
-                ws.cell(fila,COL_OBS).value=f"ERROR DE CONSULTA: {str(e)[:120]}"
+                ws.cell(fila,cfg["verificacion"]).value=f"ERROR DE CONSULTA: {str(e)[:120]}"
                 wb.save(salida)
                 self.log(f"  -> ERROR: {e}")
 
         wb.save(salida)
         self.set_estado("Proceso finalizado.")
-        resumen=(f"Finalizado. Procesadas: {total} | Verificadas: {verificados} | "
+        resumen=(f"Finalizado. Hoja: {cfg['sheet_name']} | Procesadas: {total} | Verificadas: {verificados} | "
                  f"Con diferencias: {diferencias} | No verificables/no encontradas: {no_encontrados} | Errores: {errores}")
         self.log(resumen)
         self.log(f"Archivo de salida: {salida}")
