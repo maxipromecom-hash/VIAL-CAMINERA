@@ -20,7 +20,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-VERSION = "14.0"
+VERSION = "16.0"
 URL_LOGIN = "https://sistemas.seguridad.mendoza.gov.ar/vialcaminera//servlet/com.ktksuitelr.mdlsgt.hlogin2"
 URL_CONSULTA_HINT = "wpconsultaantecedentes"
 
@@ -245,6 +245,84 @@ def _parece_marca_modelo(v):
     return bool(re.search(r"[A-Z]{3,}", n))
 
 
+
+
+def acta_canonica(valor):
+    """Normaliza actas equivalentes ignorando ceros a la izquierda tras el prefijo.
+
+    Ej.: L0002302941 == L2302941; X000123456 == X123456.
+    """
+    if valor is None:
+        return ""
+    c = compact(valor)
+    m = re.fullmatch(r"([A-Z])(\d{6,12})", c)
+    if not m:
+        return c
+    pref, dig = m.groups()
+    dig = dig.lstrip("0") or "0"
+    return pref + dig
+
+
+def cuerpo_contiene_acta_equivalente(texto, acta):
+    objetivo = acta_canonica(acta)
+    if not objetivo:
+        return False
+    cuerpo = compact(texto)
+    if objetivo in cuerpo:
+        return True
+    # Extrae identificadores L/X del resultado y compara en forma canónica.
+    for pref, dig in re.findall(r"([LXR])\s*[- ]?\s*(\d{6,12})", str(texto or "").upper()):
+        if acta_canonica(pref + dig) == objetivo:
+            return True
+    return False
+
+def _digitos_acta_sin_prefijo(valor):
+    """Devuelve los dígitos cuando la fila trae un acta vial sin letra.
+
+    Acepta, por ejemplo: 7504190, AV 7504190, A.V. 7504190, ACTA 7504190.
+    No confunde sumarios cortos del tipo 16/19 porque exige entre 6 y 12 dígitos.
+    """
+    if valor is None:
+        return None
+    if isinstance(valor, (int, float)) and not isinstance(valor, bool):
+        try:
+            if float(valor).is_integer():
+                dig = str(int(valor))
+                return dig if 6 <= len(dig) <= 12 else None
+        except Exception:
+            return None
+    raw = str(valor).upper().strip()
+    if not raw:
+        return None
+    # Si ya tiene prefijo explícito L/X/R, no es un acta sin letra.
+    if re.search(r"\b[LXR]\s*[- ]?\s*\d{6,12}\b", raw):
+        return None
+    # Celda compuesta sólo por el número.
+    m = re.fullmatch(r"\s*(\d{6,12})\s*", raw)
+    if m:
+        return m.group(1)
+    # Formatos frecuentes: AV 7504190 / A.V. 7504190 / ACTA 7504190 / ACTA VIAL 7504190.
+    m = re.search(r"\b(?:A\.?\s*V\.?|ACTA(?:\s+VIAL)?|VIAL)\s*[:\-]?\s*(\d{6,12})\b", raw)
+    if m:
+        return m.group(1)
+    return None
+
+
+def candidatos_acta_verificacion(acta, acta_original=None):
+    """Genera los identificadores que deben probarse en el sistema.
+
+    Si la fuente no trae letra, prueba en este orden: L, X y R.
+    Si ya existe una letra explícita, conserva únicamente esa acta.
+    """
+    dig = _digitos_acta_sin_prefijo(acta_original)
+    if dig:
+        return [f"L{dig}", f"X{dig}", f"R{dig}"]
+    a = compact(acta)
+    if re.fullmatch(r"[LXR]\d{6,12}", a):
+        return [a]
+    return [acta] if acta else []
+
+
 def extraer_acta_vial(valor):
     """Extrae el identificador vial útil desde formatos heterogéneos.
 
@@ -270,17 +348,18 @@ def extraer_acta_vial(valor):
     if not raw or norm(raw) in {"NO CONSTA", "SIN DATOS", "S D", "SD", "NINGUNO"}:
         return None
     # Identificador vial explícito L/X + números, aun si está dentro de una frase.
-    m = re.search(r"\b([LX])\s*[- ]?\s*(\d{6,12})\b", raw)
+    m = re.search(r"\b([LXR])\s*[- ]?\s*(\d{6,12})\b", raw)
     if m:
         return m.group(1) + m.group(2)
     # Cualquier letra + 6 o más dígitos si viene precedido por ACTA.
     m = re.search(r"\bACTA\s*[:\-]?\s*([A-Z])\s*[- ]?\s*(\d{6,12})\b", raw)
     if m:
         return m.group(1) + m.group(2)
-    # Una celda que sea sólo dígitos se interpreta como acta L (caso San Cristóbal).
-    m = re.fullmatch(r"\s*(\d{6,12})\s*", raw)
-    if m:
-        return "L" + m.group(1)
+    # Cuando el acta no trae letra, usamos L sólo como representación inicial.
+    # La verificación real probará L, X y R mediante candidatos_acta_verificacion().
+    dig = _digitos_acta_sin_prefijo(valor)
+    if dig:
+        return "L" + dig
     return None
 
 
@@ -428,7 +507,7 @@ def extraer_acta_de_fila(ws, fila, cfg):
     for c in range(1,ws.max_column+1):
         v=ws.cell(fila,c).value
         if v is None: continue
-        m=re.search(r"\b([LX])\s*[- ]?\s*(\d{6,12})\b", str(v).upper())
+        m=re.search(r"\b([LXR])\s*[- ]?\s*(\d{6,12})\b", str(v).upper())
         if m:
             return m.group(1)+m.group(2), raw
     return None, raw
@@ -436,7 +515,7 @@ def extraer_acta_de_fila(ws, fila, cfg):
 
 def es_acta_vial(acta):
     """Identificador vial explícito utilizable en la consulta."""
-    return bool(re.fullmatch(r"[LX]\d{6,12}", compact(acta)))
+    return bool(re.fullmatch(r"[LXR]\d{6,12}", compact(acta)))
 
 
 def extraer_info_objeto_simple(driver):
@@ -1356,7 +1435,7 @@ class App:
 
     def _ui(self):
         tk.Label(self.root, text="VERIFICADOR VIAL CAMINERA", font=("Segoe UI", 18, "bold")).pack(pady=(15, 3))
-        tk.Label(self.root, text=f"Versión {VERSION} UNIVERSAL · Detecta hoja/columnas automáticamente. DOMINIO↔ACTA tiene prioridad; sin dominio compara MARCA/MODELO y COLOR.", font=("Segoe UI", 10)).pack(pady=(0, 4))
+        tk.Label(self.root, text=f"Versión {VERSION} UNIVERSAL · Detecta hoja/columnas automáticamente. Normaliza actas con ceros iniciales. DOMINIO↔ACTA tiene prioridad.", font=("Segoe UI", 10)).pack(pady=(0, 4))
         tk.Label(self.root, text="No guarda usuario ni contraseña. La sesión se inicia manualmente en Chrome.", font=("Segoe UI", 9)).pack(pady=(0, 12))
 
         f = tk.Frame(self.root)
@@ -1444,7 +1523,7 @@ class App:
     def consultar_acta(self, acta):
         """Busca el acta y abre sólo Información de Objeto.
 
-        v12 elimina la lupa/Datos Descriptivos. Para vehículos sin dominio la
+        La versión universal elimina la lupa/Datos Descriptivos. Para vehículos sin dominio la
         identificación se hace con Marca/Modelo + Color de esta primera ventana.
         """
         self.volver_consulta()
@@ -1483,29 +1562,34 @@ class App:
         datos=extraer_info_objeto_simple(self.driver)
         return datos, None
 
-    def consultar_dominio_contiene_acta(self, dominio, acta):
+    def consultar_dominio_contiene_acta(self, dominio, actas):
         dominio_real=extraer_dominio_real(dominio)
         if not dominio_real:
-            return None, None
+            return None, None, None
+        candidatos = actas if isinstance(actas, (list, tuple)) else [actas]
+        candidatos = [a for a in candidatos if a]
         self.volver_consulta()
         inp=find_input_dominio(self.driver, self.log)
         if not inp:
-            return False, "NO SE ENCONTRO CAMPO DOMINIO"
+            return False, "NO SE ENCONTRO CAMPO DOMINIO", None
         if not cargar_input_geneXus(self.driver, inp, dominio_real):
-            return False, "EL SISTEMA NO ACEPTO EL DOMINIO"
-        self.log(f"  Verificación principal: Dominio {dominio_real} -> Acta {acta}")
+            return False, "EL SISTEMA NO ACEPTO EL DOMINIO", None
+        self.log(f"  Verificación principal: Dominio {dominio_real} -> Acta(s) {', '.join(candidatos)}")
         if not click_buscar(self.driver):
             inp.send_keys(Keys.ENTER)
         time.sleep(0.7)
         try:
             WebDriverWait(self.driver, 10).until(
-                lambda d: compact(acta) in compact(d.find_element(By.TAG_NAME,'body').text)
+                lambda d: any(cuerpo_contiene_acta_equivalente(d.find_element(By.TAG_NAME,'body').text, a) for a in candidatos)
                 or 'NO SE ENCONTR' in norm(d.find_element(By.TAG_NAME,'body').text)
             )
         except Exception:
             pass
         texto=self.driver.find_element(By.TAG_NAME,'body').text
-        return compact(acta) in compact(texto), None
+        for a in candidatos:
+            if cuerpo_contiene_acta_equivalente(texto, a):
+                return True, None, a
+        return False, None, None
 
     def procesar(self):
         try:
@@ -1572,6 +1656,9 @@ class App:
             if acta and acta_original is not None and compact(str(acta_original)) != compact(acta):
                 self.log(f"  Acta normalizada: '{acta_original}' -> '{acta}'")
             self.log(f"  Excel detectado: Marca/Modelo={marca_excel or ''} | Color={color_excel or ''} | Dominio={dominio_excel or ''}")
+            candidatos_acta = candidatos_acta_verificacion(acta, acta_original)
+            if len(candidatos_acta) > 1:
+                self.log(f"  Acta sin letra: se probará con {', '.join(candidatos_acta)}")
 
             try:
                 # REGLA 1: CON DOMINIO REAL, el cruce DOMINIO -> ACTA es la prueba principal.
@@ -1582,7 +1669,7 @@ class App:
                         self.log(f"  -> Dominio real {dominio_real}, pero no hay Acta Vial utilizable en la fila")
                         wb.save(salida)
                         continue
-                    cruce_ok,cruce_error=self.consultar_dominio_contiene_acta(str(dominio_excel or ''),acta)
+                    cruce_ok,cruce_error,acta_match=self.consultar_dominio_contiene_acta(str(dominio_excel or ''),candidatos_acta or [acta])
                     if cruce_error:
                         ws.cell(fila,cfg["verificacion"]).value=f"ERROR VERIFICANDO DOMINIO: {cruce_error}"
                         errores+=1
@@ -1590,11 +1677,11 @@ class App:
                     elif cruce_ok:
                         ws.cell(fila,cfg["verificacion"]).value="VERIFICADO POR DOMINIO"
                         verificados+=1
-                        self.log(f"  -> VERIFICADO POR DOMINIO ({dominio_real} ↔ {acta})")
+                        self.log(f"  -> VERIFICADO POR DOMINIO ({dominio_real} ↔ {acta_match or acta})")
                     else:
                         ws.cell(fila,cfg["verificacion"]).value="NO COINCIDE: DOMINIO NO ASOCIA ACTA"
                         diferencias+=1
-                        self.log(f"  -> DOMINIO {dominio_real} NO ASOCIA EL ACTA {acta}")
+                        self.log(f"  -> DOMINIO {dominio_real} NO ASOCIA NINGUNA ACTA PROBADA: {', '.join(candidatos_acta or [acta])}")
                     wb.save(salida)
                     continue
 
@@ -1606,7 +1693,20 @@ class App:
                     wb.save(salida)
                     continue
 
-                datos,problema=self.consultar_acta(acta)
+                datos=None
+                problema="NO ENCONTRADA"
+                acta_usada=acta
+                for candidata in (candidatos_acta or [acta]):
+                    if len(candidatos_acta or []) > 1:
+                        self.log(f"  Probando acta sin dominio como {candidata}...")
+                    datos,problema=self.consultar_acta(candidata)
+                    if not problema:
+                        acta_usada=candidata
+                        if candidata != acta:
+                            self.log(f"  -> Acta encontrada utilizando prefijo: {candidata}")
+                        break
+                    if problema != "NO ENCONTRADA":
+                        break
                 if problema:
                     if problema=="NO ENCONTRADA":
                         if es_acta_vial(acta):
