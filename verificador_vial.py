@@ -20,7 +20,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-VERSION = "16.0"
+VERSION = "17.0"
 URL_LOGIN = "https://sistemas.seguridad.mendoza.gov.ar/vialcaminera//servlet/com.ktksuitelr.mdlsgt.hlogin2"
 URL_CONSULTA_HINT = "wpconsultaantecedentes"
 
@@ -206,8 +206,27 @@ def extraer_dominio_real(v):
     return None
 
 
+def candidatos_dominio_verificacion(v):
+    """Genera variantes de dominio para la consulta.
 
-# ---------------- v14: DETECCIÓN UNIVERSAL DE PLANILLAS ----------------
+    Para dominios clásicos de seis caracteres prueba ambas orientaciones:
+    948HPD -> 948HPD y HPD948; HPD948 -> HPD948 y 948HPD.
+    Los dominios Mercosur de siete caracteres (A123ABC / AA123AA) se conservan
+    tal cual porque invertirlos produciría un formato inválido.
+    """
+    d = extraer_dominio_real(v)
+    if not d:
+        return []
+    out=[d]
+    if re.fullmatch(r"\d{3}[A-Z]{3}", d):
+        out.append(d[3:] + d[:3])
+    elif re.fullmatch(r"[A-Z]{3}\d{3}", d):
+        out.append(d[3:] + d[:3])
+    # Quitar duplicados preservando orden.
+    return list(dict.fromkeys(out))
+
+
+# ---------------- v17: DETECCIÓN UNIVERSAL DE PLANILLAS ----------------
 COLORES_BASE = {
     "NEGRO", "BLANCO", "ROJO", "GRIS", "AZUL", "VERDE", "AMARILLO",
     "BORDO", "BORDEAUX", "NARANJA", "CELESTE", "MARRON", "BEIGE",
@@ -271,7 +290,7 @@ def cuerpo_contiene_acta_equivalente(texto, acta):
     if objetivo in cuerpo:
         return True
     # Extrae identificadores L/X del resultado y compara en forma canónica.
-    for pref, dig in re.findall(r"([LXR])\s*[- ]?\s*(\d{6,12})", str(texto or "").upper()):
+    for pref, dig in re.findall(r"([LXRF])\s*[- ]?\s*(\d{6,12})", str(texto or "").upper()):
         if acta_canonica(pref + dig) == objetivo:
             return True
     return False
@@ -294,8 +313,8 @@ def _digitos_acta_sin_prefijo(valor):
     raw = str(valor).upper().strip()
     if not raw:
         return None
-    # Si ya tiene prefijo explícito L/X/R, no es un acta sin letra.
-    if re.search(r"\b[LXR]\s*[- ]?\s*\d{6,12}\b", raw):
+    # Si ya tiene prefijo explícito L/X/R/F, no es un acta sin letra.
+    if re.search(r"\b[LXRF]\s*[- ]?\s*\d{6,12}\b", raw):
         return None
     # Celda compuesta sólo por el número.
     m = re.fullmatch(r"\s*(\d{6,12})\s*", raw)
@@ -311,14 +330,14 @@ def _digitos_acta_sin_prefijo(valor):
 def candidatos_acta_verificacion(acta, acta_original=None):
     """Genera los identificadores que deben probarse en el sistema.
 
-    Si la fuente no trae letra, prueba en este orden: L, X y R.
+    Si la fuente no trae letra, prueba en este orden: L, X, R y F.
     Si ya existe una letra explícita, conserva únicamente esa acta.
     """
     dig = _digitos_acta_sin_prefijo(acta_original)
     if dig:
-        return [f"L{dig}", f"X{dig}", f"R{dig}"]
+        return [f"L{dig}", f"X{dig}", f"R{dig}", f"F{dig}"]
     a = compact(acta)
-    if re.fullmatch(r"[LXR]\d{6,12}", a):
+    if re.fullmatch(r"[LXRF]\d{6,12}", a):
         return [a]
     return [acta] if acta else []
 
@@ -347,8 +366,8 @@ def extraer_acta_vial(valor):
     raw = str(valor).upper().strip()
     if not raw or norm(raw) in {"NO CONSTA", "SIN DATOS", "S D", "SD", "NINGUNO"}:
         return None
-    # Identificador vial explícito L/X + números, aun si está dentro de una frase.
-    m = re.search(r"\b([LXR])\s*[- ]?\s*(\d{6,12})\b", raw)
+    # Identificador vial explícito L/X/R/F + números, aun si está dentro de una frase.
+    m = re.search(r"\b([LXRF])\s*[- ]?\s*(\d{6,12})\b", raw)
     if m:
         return m.group(1) + m.group(2)
     # Cualquier letra + 6 o más dígitos si viene precedido por ACTA.
@@ -356,7 +375,7 @@ def extraer_acta_vial(valor):
     if m:
         return m.group(1) + m.group(2)
     # Cuando el acta no trae letra, usamos L sólo como representación inicial.
-    # La verificación real probará L, X y R mediante candidatos_acta_verificacion().
+    # La verificación real probará L, X, R y F mediante candidatos_acta_verificacion().
     dig = _digitos_acta_sin_prefijo(valor)
     if dig:
         return "L" + dig
@@ -498,7 +517,7 @@ def detectar_estructura_excel(wb):
 
 
 def extraer_acta_de_fila(ws, fila, cfg):
-    """Usa la columna detectada y, si hace falta, busca un L/X######## en toda la fila."""
+    """Usa la columna detectada y, si hace falta, busca un L/X/R/F######## en toda la fila."""
     raw=ws.cell(fila,cfg["acta"]).value if cfg.get("acta") else None
     acta=extraer_acta_vial(raw)
     if acta:
@@ -507,7 +526,7 @@ def extraer_acta_de_fila(ws, fila, cfg):
     for c in range(1,ws.max_column+1):
         v=ws.cell(fila,c).value
         if v is None: continue
-        m=re.search(r"\b([LXR])\s*[- ]?\s*(\d{6,12})\b", str(v).upper())
+        m=re.search(r"\b([LXRF])\s*[- ]?\s*(\d{6,12})\b", str(v).upper())
         if m:
             return m.group(1)+m.group(2), raw
     return None, raw
@@ -515,7 +534,7 @@ def extraer_acta_de_fila(ws, fila, cfg):
 
 def es_acta_vial(acta):
     """Identificador vial explícito utilizable en la consulta."""
-    return bool(re.fullmatch(r"[LXR]\d{6,12}", compact(acta)))
+    return bool(re.fullmatch(r"[LXRF]\d{6,12}", compact(acta)))
 
 
 def extraer_info_objeto_simple(driver):
@@ -1563,32 +1582,39 @@ class App:
         return datos, None
 
     def consultar_dominio_contiene_acta(self, dominio, actas):
-        dominio_real=extraer_dominio_real(dominio)
-        if not dominio_real:
+        dominios = candidatos_dominio_verificacion(dominio)
+        if not dominios:
             return None, None, None
         candidatos = actas if isinstance(actas, (list, tuple)) else [actas]
         candidatos = [a for a in candidatos if a]
-        self.volver_consulta()
-        inp=find_input_dominio(self.driver, self.log)
-        if not inp:
-            return False, "NO SE ENCONTRO CAMPO DOMINIO", None
-        if not cargar_input_geneXus(self.driver, inp, dominio_real):
-            return False, "EL SISTEMA NO ACEPTO EL DOMINIO", None
-        self.log(f"  Verificación principal: Dominio {dominio_real} -> Acta(s) {', '.join(candidatos)}")
-        if not click_buscar(self.driver):
-            inp.send_keys(Keys.ENTER)
-        time.sleep(0.7)
-        try:
-            WebDriverWait(self.driver, 10).until(
-                lambda d: any(cuerpo_contiene_acta_equivalente(d.find_element(By.TAG_NAME,'body').text, a) for a in candidatos)
-                or 'NO SE ENCONTR' in norm(d.find_element(By.TAG_NAME,'body').text)
-            )
-        except Exception:
-            pass
-        texto=self.driver.find_element(By.TAG_NAME,'body').text
-        for a in candidatos:
-            if cuerpo_contiene_acta_equivalente(texto, a):
-                return True, None, a
+
+        for idx, dominio_prueba in enumerate(dominios, start=1):
+            self.volver_consulta()
+            inp=find_input_dominio(self.driver, self.log)
+            if not inp:
+                return False, "NO SE ENCONTRO CAMPO DOMINIO", None
+            if not cargar_input_geneXus(self.driver, inp, dominio_prueba):
+                return False, "EL SISTEMA NO ACEPTO EL DOMINIO", None
+            if len(dominios) > 1:
+                self.log(f"  Verificación principal: Dominio {dominio_prueba} (variante {idx}/{len(dominios)}) -> Acta(s) {', '.join(candidatos)}")
+            else:
+                self.log(f"  Verificación principal: Dominio {dominio_prueba} -> Acta(s) {', '.join(candidatos)}")
+            if not click_buscar(self.driver):
+                inp.send_keys(Keys.ENTER)
+            time.sleep(0.7)
+            try:
+                WebDriverWait(self.driver, 10).until(
+                    lambda d: any(cuerpo_contiene_acta_equivalente(d.find_element(By.TAG_NAME,'body').text, a) for a in candidatos)
+                    or 'NO SE ENCONTR' in norm(d.find_element(By.TAG_NAME,'body').text)
+                )
+            except Exception:
+                pass
+            texto=self.driver.find_element(By.TAG_NAME,'body').text
+            for a in candidatos:
+                if cuerpo_contiene_acta_equivalente(texto, a):
+                    if idx > 1:
+                        self.log(f"  -> Coincidencia hallada usando dominio invertido: {dominio_prueba}")
+                    return True, None, a
         return False, None, None
 
     def procesar(self):
@@ -1641,6 +1667,7 @@ class App:
             acta, acta_original = extraer_acta_de_fila(ws,fila,cfg)
             dominio_excel=ws.cell(fila,cfg["dominio"]).value
             dominio_real=extraer_dominio_real(dominio_excel)
+            dominios_prueba=candidatos_dominio_verificacion(dominio_excel)
             marca_excel=ws.cell(fila,cfg["marca_modelo"]).value
             color_excel=ws.cell(fila,cfg["color"]).value
 
@@ -1656,6 +1683,8 @@ class App:
             if acta and acta_original is not None and compact(str(acta_original)) != compact(acta):
                 self.log(f"  Acta normalizada: '{acta_original}' -> '{acta}'")
             self.log(f"  Excel detectado: Marca/Modelo={marca_excel or ''} | Color={color_excel or ''} | Dominio={dominio_excel or ''}")
+            if len(dominios_prueba) > 1:
+                self.log(f"  Dominio clásico: se probará también invertido -> {', '.join(dominios_prueba)}")
             candidatos_acta = candidatos_acta_verificacion(acta, acta_original)
             if len(candidatos_acta) > 1:
                 self.log(f"  Acta sin letra: se probará con {', '.join(candidatos_acta)}")
