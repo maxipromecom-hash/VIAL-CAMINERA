@@ -20,7 +20,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-VERSION = "18.0"
+VERSION = "19.0"
 URL_LOGIN = "https://sistemas.seguridad.mendoza.gov.ar/vialcaminera//servlet/com.ktksuitelr.mdlsgt.hlogin2"
 URL_CONSULTA_HINT = "wpconsultaantecedentes"
 
@@ -1459,15 +1459,226 @@ def asegurar_columna_acta_sugerida(ws, header_row):
     return c
 
 
+def ruta_recurso(nombre):
+    """Devuelve la ruta de un recurso tanto en .py como dentro del EXE de PyInstaller."""
+    candidatos=[]
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        candidatos.append(os.path.join(sys._MEIPASS, nombre))
+    candidatos.append(os.path.join(directorio_app(), nombre))
+    for r in candidatos:
+        if os.path.exists(r):
+            return r
+    return candidatos[-1]
+
+
+def buscar_columna_por_encabezado(ws, header_row, grupos):
+    """Busca una columna por sinónimos de encabezado. grupos = [(palabras obligatorias), ...]."""
+    for c in range(1, ws.max_column + 1):
+        h = _header(ws.cell(header_row, c).value)
+        if not h:
+            continue
+        for grupo in grupos:
+            if all(p in h for p in grupo):
+                return c
+    return None
+
+
+def detectar_columna_juzgado(ws, header_row, cfg=None):
+    if cfg and cfg.get("interviene"):
+        return cfg["interviene"]
+    return buscar_columna_por_encabezado(ws, header_row, [
+        ("JUZGADO",), ("INTERVIENE",), ("INTERVINIENTE",), ("JDO",)
+    ])
+
+
+def normalizar_juzgado_para_titulo(v):
+    s = str(v or "").strip()
+    if not s:
+        return ""
+    # Mantener la denominación original, sólo compactar espacios y saltos.
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def juzgados_presentes(ws, filas, header_row, cfg=None):
+    col = detectar_columna_juzgado(ws, header_row, cfg)
+    if not col:
+        return []
+    vistos=set(); salida=[]
+    for fila in filas:
+        j = normalizar_juzgado_para_titulo(ws.cell(fila, col).value)
+        if not j:
+            continue
+        clave = norm(j)
+        if clave in {"NO CONSTA", "SIN DATO", "S D", "SD", "NINGUNO", "-"}:
+            continue
+        if clave not in vistos:
+            vistos.add(clave)
+            salida.append(j)
+    return salida
+
+
+def _copiar_estilo_celda(origen, destino):
+    try:
+        from copy import copy
+        if origen.has_style:
+            destino._style = copy(origen._style)
+        destino.font = copy(origen.font)
+        destino.fill = copy(origen.fill)
+        destino.border = copy(origen.border)
+        destino.alignment = copy(origen.alignment)
+        destino.number_format = origen.number_format
+        destino.protection = copy(origen.protection)
+    except Exception:
+        pass
+
+
+def _preparar_hoja_disposicion(ws, nombre_hoja, subtitulo, juzgados, filas_datos):
+    """Limpia el modelo dejando títulos/encabezados y carga los datos finales."""
+    ws.title = nombre_hoja[:31]
+    # Guardar estilo de la primera fila de datos del modelo antes de borrar.
+    estilos=[]
+    valores_modelo=[]
+    for c in range(1, 9):
+        cel=ws.cell(4,c)
+        estilos.append(cel)
+        valores_modelo.append(cel.value)
+    altura_modelo = ws.row_dimensions[4].height
+
+    if ws.max_row >= 4:
+        ws.delete_rows(4, ws.max_row - 3)
+
+    # Título: mostrar los juzgados presentes AL LADO DE PRO.ME.COM.
+    texto_juzgados = " - JUZGADOS: " + " - ".join(juzgados) if juzgados else " - JUZGADOS: SIN DATO"
+    ws["E1"] = "PRO.ME.COM" + texto_juzgados
+    try:
+        from copy import copy
+        al=copy(ws["E1"].alignment); al.wrap_text=True; al.horizontal="center"; al.vertical="center"; ws["E1"].alignment=al
+    except Exception:
+        pass
+    try:
+        # Tamaño dinámico para títulos largos.
+        from copy import copy
+        largo=len(ws["E1"].value or "")
+        tam=11 if largo <= 90 else 9 if largo <= 150 else 8
+        ft=copy(ws["E1"].font); ft.sz=tam; ft.bold=True; ws["E1"].font=ft
+        ws.row_dimensions[1].height = 28 if largo <= 110 else 42
+    except Exception:
+        pass
+
+    # Conservar el título territorial del modelo y agregar el tipo de listado.
+    titulo_base = str(ws["E2"].value or "").strip()
+    if subtitulo:
+        if titulo_base:
+            ws["E2"] = f"{titulo_base}    |    {subtitulo}"
+        else:
+            ws["E2"] = subtitulo
+    try:
+        from copy import copy
+        al=copy(ws["E2"].alignment); al.wrap_text=True; al.horizontal="center"; al.vertical="center"; ws["E2"].alignment=al
+    except Exception:
+        pass
+
+    for idx, datos in enumerate(filas_datos, start=1):
+        r = idx + 3
+        fila_val=[idx] + list(datos)
+        for c, val in enumerate(fila_val, start=1):
+            dst=ws.cell(r,c)
+            dst.value=val
+            _copiar_estilo_celda(estilos[c-1], dst)
+        if altura_modelo:
+            ws.row_dimensions[r].height = altura_modelo
+
+    # Repetir encabezados al imprimir y ajustar área.
+    try:
+        ws.print_title_rows = '1:3'
+        ws.print_area = f'A1:H{max(3, len(filas_datos)+3)}'
+    except Exception:
+        pass
+
+
+def generar_disposicion_final_desde_archivo(ruta_origen, ruta_salida=None):
+    """Genera un Excel de Disposición Final con VERIFICADOS y CON DIFERENCIAS.
+
+    Usa el modelo oficial suministrado por el usuario y muestra en E1, al lado de
+    PRO.ME.COM, los juzgados que efectivamente aparecen en cada listado.
+    """
+    if not ruta_origen or not os.path.exists(ruta_origen):
+        raise RuntimeError("No se encontró el Excel verificado para generar la Disposición Final.")
+
+    wb_src = load_workbook(ruta_origen, data_only=False)
+    cfg = detectar_estructura_excel(wb_src)
+    ws_src = cfg["sheet"]
+    h = cfg["header_row"]
+
+    col_interno = buscar_columna_por_encabezado(ws_src, h, [
+        ("INTERNO",), ("REGISTRO",), ("NRO", "REG"), ("N°", "REG")
+    ])
+    col_motor = buscar_columna_por_encabezado(ws_src, h, [("MOTOR",)])
+    col_acta_sug = buscar_columna_por_encabezado(ws_src, h, [("ACTA", "VIAL", "SUGERIDA"), ("ACTA", "VIAL", "DETECTADA")])
+
+    verificadas=[]
+    diferencias=[]
+    filas_ver=[]
+    filas_dif=[]
+
+    for fila in range(h+1, ws_src.max_row+1):
+        estado = str(ws_src.cell(fila, cfg["verificacion"]).value or "").strip()
+        ne = norm(estado)
+        if not ne:
+            continue
+        es_ver = "VERIFICADO" in ne and "NO VERIFICADO" not in ne
+        es_dif = ne.startswith("NO COINCIDE") or "DIFERENCIAS" in ne
+        if not (es_ver or es_dif):
+            continue
+
+        interno = ws_src.cell(fila, col_interno).value if col_interno else ""
+        tipo = ws_src.cell(fila, cfg["tipo"]).value if cfg.get("tipo") else ""
+        marca = ws_src.cell(fila, cfg["marca_modelo"]).value if cfg.get("marca_modelo") else ""
+        dominio = ws_src.cell(fila, cfg["dominio"]).value if cfg.get("dominio") else ""
+        color = ws_src.cell(fila, cfg["color"]).value if cfg.get("color") else ""
+        motor = ws_src.cell(fila, col_motor).value if col_motor else ""
+        sumario = ws_src.cell(fila, cfg["acta"]).value if cfg.get("acta") else ""
+        if (sumario is None or not str(sumario).strip()) and col_acta_sug:
+            sug=ws_src.cell(fila, col_acta_sug).value
+            if sug and not str(sug).upper().startswith("ERROR") and "NO SE ENCONTRO" not in norm(sug):
+                sumario=sug
+        datos=[interno or "", tipo or "", marca or "", dominio or "", color or "", motor or "", sumario or ""]
+        if es_ver:
+            verificadas.append(datos); filas_ver.append(fila)
+        else:
+            diferencias.append(datos); filas_dif.append(fila)
+
+    modelo = ruta_recurso("modelo_resolucion_final.xlsx")
+    if not os.path.exists(modelo):
+        raise RuntimeError("No encontré el archivo modelo_resolucion_final.xlsx junto al programa.")
+    wb_out = load_workbook(modelo)
+    base = wb_out[wb_out.sheetnames[0]]
+    hoja_dif = wb_out.copy_worksheet(base)
+
+    j_ver = juzgados_presentes(ws_src, filas_ver, h, cfg)
+    j_dif = juzgados_presentes(ws_src, filas_dif, h, cfg)
+
+    _preparar_hoja_disposicion(base, "VERIFICADOS", "VEHÍCULOS VERIFICADOS", j_ver, verificadas)
+    _preparar_hoja_disposicion(hoja_dif, "CON DIFERENCIAS", "VEHÍCULOS CON DIFERENCIAS", j_dif, diferencias)
+
+    if ruta_salida is None:
+        carpeta,nombre=os.path.split(ruta_origen)
+        base_nombre=os.path.splitext(nombre)[0]
+        ruta_salida=os.path.join(carpeta, f"{base_nombre}_DISPOSICION_FINAL.xlsx")
+    wb_out.save(ruta_salida)
+    return ruta_salida, len(verificadas), len(diferencias), j_ver, j_dif
+
+
 class App:
     def __init__(self, root):
         self.root = root
         self.root.title(f"Verificador Vial Caminera v{VERSION}")
-        self.root.geometry("920x690")
-        self.root.minsize(820, 600)
+        self.root.geometry("1040x740")
+        self.root.minsize(900, 650)
         self.driver = None
         self.consulta_url = None
         self.stop_flag = False
+        self.ultimo_archivo_salida = None
         self.archivo = tk.StringVar()
         self.solo_pendientes = tk.BooleanVar(value=True)
         self.limite = tk.StringVar(value="1")
@@ -1475,7 +1686,7 @@ class App:
 
     def _ui(self):
         tk.Label(self.root, text="VERIFICADOR VIAL CAMINERA", font=("Segoe UI", 18, "bold")).pack(pady=(15, 3))
-        tk.Label(self.root, text=f"Versión {VERSION} UNIVERSAL · Actas L/X/R/F · dominio normal/invertido · sugiere Acta Vial SOLO si la celda original está vacía.", font=("Segoe UI", 10)).pack(pady=(0, 4))
+        tk.Label(self.root, text=f"Versión {VERSION} UNIVERSAL · Actas L/X/R/F · dominio normal/invertido · Disposición Final con juzgados presentes.", font=("Segoe UI", 10)).pack(pady=(0, 4))
         tk.Label(self.root, text="No guarda usuario ni contraseña. La sesión se inicia manualmente en Chrome.", font=("Segoe UI", 9)).pack(pady=(0, 12))
 
         f = tk.Frame(self.root)
@@ -1494,7 +1705,8 @@ class App:
         botones.pack(fill="x", padx=20, pady=(0, 10))
         tk.Button(botones, text="1. ABRIR SISTEMA / INICIAR SESIÓN", command=self.abrir_sistema, height=2).pack(side="left", fill="x", expand=True)
         tk.Button(botones, text="2. INICIAR VERIFICACIÓN", command=self.iniciar, height=2).pack(side="left", fill="x", expand=True, padx=8)
-        tk.Button(botones, text="DETENER", command=self.detener, height=2).pack(side="left")
+        tk.Button(botones, text="3. GENERAR DISPOSICIÓN FINAL", command=self.generar_disposicion, height=2).pack(side="left", fill="x", expand=True)
+        tk.Button(botones, text="DETENER", command=self.detener, height=2).pack(side="left", padx=(8,0))
 
         self.estado = tk.Label(self.root, text="Listo.", anchor="w", font=("Segoe UI", 10, "bold"))
         self.estado.pack(fill="x", padx=20, pady=(2, 5))
@@ -1513,6 +1725,32 @@ class App:
         if p:
             self.archivo.set(p)
             self.log(f"Excel seleccionado: {p}")
+
+    def generar_disposicion(self):
+        """Genera el Excel final sin necesidad de tener Chrome abierto."""
+        origen = self.ultimo_archivo_salida
+        if not origen or not os.path.exists(origen):
+            p=self.archivo.get()
+            if p and os.path.exists(p):
+                carpeta,nombre=os.path.split(p)
+                base,ext=os.path.splitext(nombre)
+                candidato=os.path.join(carpeta, f"{base}_VERIFICADO{ext}")
+                origen = candidato if os.path.exists(candidato) else p
+        if not origen or not os.path.exists(origen):
+            messagebox.showwarning("Disposición Final", "Seleccione primero el Excel verificado.")
+            return
+        try:
+            self.set_estado("Generando Disposición Final...")
+            salida,nver,ndif,jver,jdif=generar_disposicion_final_desde_archivo(origen)
+            self.log(f"Disposición Final generada: {salida}")
+            self.log(f"  VERIFICADOS: {nver} | Juzgados presentes: {', '.join(jver) if jver else 'SIN DATO'}")
+            self.log(f"  CON DIFERENCIAS: {ndif} | Juzgados presentes: {', '.join(jdif) if jdif else 'SIN DATO'}")
+            self.set_estado("Disposición Final generada.")
+            messagebox.showinfo("Disposición Final", f"Archivo generado correctamente.\n\nVerificados: {nver}\nCon diferencias: {ndif}\n\n{salida}")
+        except Exception as e:
+            self.set_estado("Error generando Disposición Final.")
+            self.log(f"ERROR GENERANDO DISPOSICIÓN FINAL: {e}")
+            messagebox.showerror("Disposición Final", str(e))
 
     def abrir_sistema(self):
         try:
@@ -1857,6 +2095,7 @@ class App:
                 self.log(f"  -> ERROR: {e}")
 
         wb.save(salida)
+        self.ultimo_archivo_salida = salida
         self.set_estado("Proceso finalizado.")
         resumen=(f"Finalizado. Hoja: {cfg['sheet_name']} | Procesadas: {total} | Verificadas: {verificados} | "
                  f"Con diferencias: {diferencias} | No verificables/no encontradas: {no_encontrados} | Errores: {errores}")
