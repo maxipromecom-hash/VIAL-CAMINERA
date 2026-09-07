@@ -20,7 +20,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-VERSION = "19.0"
+VERSION = "20.0"
 URL_LOGIN = "https://sistemas.seguridad.mendoza.gov.ar/vialcaminera//servlet/com.ktksuitelr.mdlsgt.hlogin2"
 URL_CONSULTA_HINT = "wpconsultaantecedentes"
 
@@ -1471,6 +1471,37 @@ def ruta_recurso(nombre):
     return candidatos[-1]
 
 
+def obtener_modelo_resolucion_final():
+    """Obtiene el modelo de Disposición Final de forma robusta.
+
+    Orden de búsqueda:
+    1) recurso de PyInstaller (_MEIPASS),
+    2) archivo junto al programa,
+    3) copia embebida dentro del propio EXE.
+    """
+    ruta = ruta_recurso("modelo_resolucion_final.xlsx")
+    if ruta and os.path.exists(ruta):
+        return ruta
+
+    try:
+        from modelo_resolucion_embebido import obtener_modelo_bytes
+        import tempfile
+        carpeta = os.path.join(tempfile.gettempdir(), "Verificador_Vial_Caminera")
+        os.makedirs(carpeta, exist_ok=True)
+        destino = os.path.join(carpeta, "modelo_resolucion_final_v20.xlsx")
+        datos = obtener_modelo_bytes()
+        # Regenerar si no existe o quedó incompleto.
+        if (not os.path.exists(destino)) or os.path.getsize(destino) != len(datos):
+            with open(destino, "wb") as f:
+                f.write(datos)
+        return destino
+    except Exception as e:
+        raise RuntimeError(
+            "No pude cargar el modelo de Disposición Final. "
+            f"Detalle: {e}"
+        )
+
+
 def buscar_columna_por_encabezado(ws, header_row, grupos):
     """Busca una columna por sinónimos de encabezado. grupos = [(palabras obligatorias), ...]."""
     for c in range(1, ws.max_column + 1):
@@ -1648,9 +1679,7 @@ def generar_disposicion_final_desde_archivo(ruta_origen, ruta_salida=None):
         else:
             diferencias.append(datos); filas_dif.append(fila)
 
-    modelo = ruta_recurso("modelo_resolucion_final.xlsx")
-    if not os.path.exists(modelo):
-        raise RuntimeError("No encontré el archivo modelo_resolucion_final.xlsx junto al programa.")
+    modelo = obtener_modelo_resolucion_final()
     wb_out = load_workbook(modelo)
     base = wb_out[wb_out.sheetnames[0]]
     hoja_dif = wb_out.copy_worksheet(base)
@@ -1686,7 +1715,7 @@ class App:
 
     def _ui(self):
         tk.Label(self.root, text="VERIFICADOR VIAL CAMINERA", font=("Segoe UI", 18, "bold")).pack(pady=(15, 3))
-        tk.Label(self.root, text=f"Versión {VERSION} UNIVERSAL · Actas L/X/R/F · dominio normal/invertido · Disposición Final con juzgados presentes.", font=("Segoe UI", 10)).pack(pady=(0, 4))
+        tk.Label(self.root, text=f"Versión {VERSION} UNIVERSAL · Actas L/X/R/F · dominio normal/invertido · Disposición Final · modelo embebido.", font=("Segoe UI", 10)).pack(pady=(0, 4))
         tk.Label(self.root, text="No guarda usuario ni contraseña. La sesión se inicia manualmente en Chrome.", font=("Segoe UI", 9)).pack(pady=(0, 12))
 
         f = tk.Frame(self.root)
