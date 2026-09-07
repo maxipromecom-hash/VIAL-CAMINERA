@@ -20,7 +20,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-VERSION = "21.0"
+VERSION = "23.0"
 
 # Modelo de Disposición Final embebido directamente en este archivo.
 # Esto evita depender de módulos o archivos auxiliares al compilar con PyInstaller --onefile.
@@ -5970,6 +5970,88 @@ def buscar_columna_por_encabezado(ws, header_row, grupos):
     return None
 
 
+
+
+def detectar_columna_secuestro(ws, header_row):
+    """Detecta la columna que contiene el número de secuestro/ingreso.
+
+    Prioriza encabezados como SECUESTRO, SEC, NUMERO/NRO DE INGRESO.
+    Si no encuentra un encabezado reconocible, usa la primera columna,
+    de acuerdo con la estructura habitual de las planillas del usuario.
+    """
+    for c in range(1, ws.max_column + 1):
+        h = _header(ws.cell(header_row, c).value)
+        if not h:
+            continue
+        hc = re.sub(r"[^A-Z0-9]+", " " , h).strip()
+        tokens = hc.split()
+        if "SECUESTRO" in tokens or hc == "SEC" or hc.startswith("SEC " ) or hc.endswith(" SEC"):
+            return c
+        if "INGRESO" in tokens and any(t in tokens for t in ("NUMERO", "NRO", "NO", "N")):
+            return c
+        if hc in {"NRO SEC", "NUMERO SEC", "NO SEC", "N SEC"}:
+            return c
+    return 1 if ws.max_column >= 1 else None
+
+def detectar_columna_anio_secuestro(ws, header_row):
+    """Detecta una columna separada de año para el número de secuestro, si existe."""
+    for c in range(1, ws.max_column + 1):
+        h = _header(ws.cell(header_row, c).value)
+        if not h:
+            continue
+        hc = re.sub(r"[^A-Z0-9]+", " ", h).strip()
+        tokens = hc.split()
+        # AÑO/ANIO solo, o expresamente vinculado a secuestro/ingreso.
+        if hc in {"ANO", "ANIO", "AÑO"}:
+            return c
+        if any(t in tokens for t in ("ANO", "ANIO", "AÑO")) and any(t in tokens for t in ("SECUESTRO", "SEC", "INGRESO")):
+            return c
+    return None
+
+
+def normalizar_numero_secuestro(valor, anio=None):
+    """Conserva y estandariza el número de secuestro incluyendo su año.
+
+    Ejemplos admitidos:
+      1524/22   -> 1524/22
+      1524-22   -> 1524/22
+      SEC 1524/2023 -> 1524/23
+      1524 + columna AÑO=2024 -> 1524/24
+
+    Si el origen no informa año, no se inventa ninguno.
+    """
+    if valor is None:
+        return ""
+    if isinstance(valor, float) and valor.is_integer():
+        s = str(int(valor))
+    else:
+        s = str(valor).strip()
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return ""
+
+    # Prioridad: año ya incorporado al propio número de secuestro.
+    m = re.search(r"(?<!\d)(\d{1,10})\s*[/\-]\s*((?:19|20)?\d{2})(?!\d)", s)
+    if m:
+        numero = m.group(1)
+        yy = m.group(2)[-2:]
+        return f"{numero}/{yy}"
+
+    # Si el número y el año vienen en columnas separadas, unirlos.
+    if anio is not None and str(anio).strip():
+        a = str(anio).strip()
+        if isinstance(anio, float) and anio.is_integer():
+            a = str(int(anio))
+        ma = re.search(r"(?<!\d)((?:19|20)?\d{2})(?!\d)", a)
+        mn = re.search(r"(?<!\d)(\d{1,10})(?!\d)", s)
+        if ma and mn:
+            yy = ma.group(1)[-2:]
+            return f"{mn.group(1)}/{yy}"
+
+    # Sin año explícito: conservar el valor original; nunca inferir/inventar el año.
+    return s
+
+
 def detectar_columna_juzgado(ws, header_row, cfg=None):
     if cfg and cfg.get("interviene"):
         return cfg["interviene"]
@@ -6065,13 +6147,19 @@ def _preparar_hoja_disposicion(ws, nombre_hoja, subtitulo, juzgados, filas_datos
     except Exception:
         pass
 
+    # La primera columna del modelo corresponde al NRO DE SECUESTRO real,
+    # no a una enumeración correlativa generada por el programa.
+    ws["A3"] = "NRO SECUESTRO"
     for idx, datos in enumerate(filas_datos, start=1):
         r = idx + 3
-        fila_val=[idx] + list(datos)
+        fila_val=list(datos)
         for c, val in enumerate(fila_val, start=1):
             dst=ws.cell(r,c)
             dst.value=val
             _copiar_estilo_celda(estilos[c-1], dst)
+            if c == 1:
+                # El NRO SECUESTRO es identificador, no cantidad: conservar /AA como texto.
+                dst.number_format = "@"
         if altura_modelo:
             ws.row_dimensions[r].height = altura_modelo
 
@@ -6097,6 +6185,8 @@ def generar_disposicion_final_desde_archivo(ruta_origen, ruta_salida=None):
     ws_src = cfg["sheet"]
     h = cfg["header_row"]
 
+    col_secuestro = detectar_columna_secuestro(ws_src, h)
+    col_anio_secuestro = detectar_columna_anio_secuestro(ws_src, h)
     col_interno = buscar_columna_por_encabezado(ws_src, h, [
         ("INTERNO",), ("REGISTRO",), ("NRO", "REG"), ("N°", "REG")
     ])
@@ -6118,6 +6208,9 @@ def generar_disposicion_final_desde_archivo(ruta_origen, ruta_salida=None):
         if not (es_ver or es_dif):
             continue
 
+        secuestro_raw = ws_src.cell(fila, col_secuestro).value if col_secuestro else ""
+        anio_sec = ws_src.cell(fila, col_anio_secuestro).value if col_anio_secuestro else None
+        secuestro = normalizar_numero_secuestro(secuestro_raw, anio_sec)
         interno = ws_src.cell(fila, col_interno).value if col_interno else ""
         tipo = ws_src.cell(fila, cfg["tipo"]).value if cfg.get("tipo") else ""
         marca = ws_src.cell(fila, cfg["marca_modelo"]).value if cfg.get("marca_modelo") else ""
@@ -6129,7 +6222,7 @@ def generar_disposicion_final_desde_archivo(ruta_origen, ruta_salida=None):
             sug=ws_src.cell(fila, col_acta_sug).value
             if sug and not str(sug).upper().startswith("ERROR") and "NO SE ENCONTRO" not in norm(sug):
                 sumario=sug
-        datos=[interno or "", tipo or "", marca or "", dominio or "", color or "", motor or "", sumario or ""]
+        datos=[secuestro or "", interno or "", tipo or "", marca or "", dominio or "", color or "", motor or "", sumario or ""]
         if es_ver:
             verificadas.append(datos); filas_ver.append(fila)
         else:
@@ -6171,7 +6264,7 @@ class App:
 
     def _ui(self):
         tk.Label(self.root, text="VERIFICADOR VIAL CAMINERA", font=("Segoe UI", 18, "bold")).pack(pady=(15, 3))
-        tk.Label(self.root, text=f"Versión {VERSION} UNIVERSAL · Actas L/X/R/F · dominio normal/invertido · Disposición Final · modelo embebido.", font=("Segoe UI", 10)).pack(pady=(0, 4))
+        tk.Label(self.root, text=f"Versión {VERSION} UNIVERSAL · Actas L/X/R/F · dominio normal/invertido · Disposición Final · secuestro con año · modelo embebido.", font=("Segoe UI", 10)).pack(pady=(0, 4))
         tk.Label(self.root, text="No guarda usuario ni contraseña. La sesión se inicia manualmente en Chrome.", font=("Segoe UI", 9)).pack(pady=(0, 12))
 
         f = tk.Frame(self.root)
