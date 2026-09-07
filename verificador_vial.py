@@ -20,7 +20,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-VERSION = "17.0"
+VERSION = "18.0"
 URL_LOGIN = "https://sistemas.seguridad.mendoza.gov.ar/vialcaminera//servlet/com.ktksuitelr.mdlsgt.hlogin2"
 URL_CONSULTA_HINT = "wpconsultaantecedentes"
 
@@ -1438,6 +1438,27 @@ def extraer_datos(texto):
     return datos
 
 
+def extraer_primera_acta_vial_de_texto(texto):
+    """Devuelve la primera Acta Vial L/X/R/F visible, en el orden del resultado."""
+    texto = str(texto or "").upper()
+    patron = re.compile(r"(?<![A-Z0-9])([LXRF])\s*[- ]?\s*(\d{5,12})(?!\d)")
+    for m in patron.finditer(texto):
+        acta = acta_canonica(m.group(1) + m.group(2))
+        if es_acta_vial(acta):
+            return acta
+    return None
+
+
+def asegurar_columna_acta_sugerida(ws, header_row):
+    """Crea/reutiliza una columna separada; nunca pisa la celda original de Acta/Sumario."""
+    for c in range(1, ws.max_column + 1):
+        if norm(ws.cell(header_row, c).value) in {"ACTA VIAL SUGERIDA", "ACTA VIAL DETECTADA"}:
+            return c
+    c = ws.max_column + 1
+    ws.cell(header_row, c).value = "ACTA VIAL SUGERIDA"
+    return c
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -1454,7 +1475,7 @@ class App:
 
     def _ui(self):
         tk.Label(self.root, text="VERIFICADOR VIAL CAMINERA", font=("Segoe UI", 18, "bold")).pack(pady=(15, 3))
-        tk.Label(self.root, text=f"Versión {VERSION} UNIVERSAL · Detecta hoja/columnas automáticamente. Normaliza actas con ceros iniciales. DOMINIO↔ACTA tiene prioridad.", font=("Segoe UI", 10)).pack(pady=(0, 4))
+        tk.Label(self.root, text=f"Versión {VERSION} UNIVERSAL · Actas L/X/R/F · dominio normal/invertido · sugiere Acta Vial SOLO si la celda original está vacía.", font=("Segoe UI", 10)).pack(pady=(0, 4))
         tk.Label(self.root, text="No guarda usuario ni contraseña. La sesión se inicia manualmente en Chrome.", font=("Segoe UI", 9)).pack(pady=(0, 12))
 
         f = tk.Frame(self.root)
@@ -1617,6 +1638,39 @@ class App:
                     return True, None, a
         return False, None, None
 
+    def consultar_dominio_primera_acta(self, dominio):
+        """Busca un dominio y devuelve la primera Acta Vial L/X/R/F visible.
+
+        Se usa EXCLUSIVAMENTE cuando la celda original destinada al Acta Vial está vacía.
+        Prueba también la orientación invertida de dominios clásicos cuando corresponde.
+        """
+        dominios = candidatos_dominio_verificacion(dominio)
+        if not dominios:
+            return None, "DOMINIO NO UTILIZABLE", None
+        for idx, dominio_prueba in enumerate(dominios, start=1):
+            self.volver_consulta()
+            inp = find_input_dominio(self.driver, self.log)
+            if not inp:
+                return None, "NO SE ENCONTRO CAMPO DOMINIO", None
+            if not cargar_input_geneXus(self.driver, inp, dominio_prueba):
+                return None, "EL SISTEMA NO ACEPTO EL DOMINIO", None
+            self.log(f"  Celda Acta Vial VACÍA: buscando primera acta para dominio {dominio_prueba} ({idx}/{len(dominios)})")
+            if not click_buscar(self.driver):
+                inp.send_keys(Keys.ENTER)
+            time.sleep(0.8)
+            try:
+                WebDriverWait(self.driver, 10).until(
+                    lambda d: extraer_primera_acta_vial_de_texto(d.find_element(By.TAG_NAME,'body').text) is not None
+                    or 'NO SE ENCONTR' in norm(d.find_element(By.TAG_NAME,'body').text)
+                )
+            except Exception:
+                pass
+            texto = self.driver.find_element(By.TAG_NAME,'body').text
+            acta = extraer_primera_acta_vial_de_texto(texto)
+            if acta:
+                return acta, None, dominio_prueba
+        return None, None, None
+
     def procesar(self):
         try:
             limite=int(self.limite.get() or "0")
@@ -1640,6 +1694,7 @@ class App:
             self.root.after(0,lambda: messagebox.showerror("Estructura Excel", str(e)))
             return
         ws=cfg["sheet"]
+        col_acta_sugerida = asegurar_columna_acta_sugerida(ws, cfg["header_row"])
         total=verificados=diferencias=no_encontrados=errores=0
 
         def colname(n):
@@ -1665,6 +1720,8 @@ class App:
                 continue
 
             acta, acta_original = extraer_acta_de_fila(ws,fila,cfg)
+            acta_celda_original = ws.cell(fila, cfg["acta"]).value if cfg.get("acta") else None
+            acta_celda_vacia = acta_celda_original is None or not str(acta_celda_original).strip()
             dominio_excel=ws.cell(fila,cfg["dominio"]).value
             dominio_real=extraer_dominio_real(dominio_excel)
             dominios_prueba=candidatos_dominio_verificacion(dominio_excel)
@@ -1690,6 +1747,24 @@ class App:
                 self.log(f"  Acta sin letra: se probará con {', '.join(candidatos_acta)}")
 
             try:
+                # REGLA ESPECIAL v18: SOLO si la CELDA ORIGINAL de Acta Vial está VACÍA
+                # y existe un dominio real, buscar qué primera Acta Vial L/X/R/F figura asociada.
+                # No modifica la celda original: escribe el hallazgo en ACTA VIAL SUGERIDA.
+                if dominio_real and acta_celda_vacia:
+                    sugerida, error_sug, dominio_usado = self.consultar_dominio_primera_acta(str(dominio_excel or ''))
+                    if error_sug:
+                        ws.cell(fila, col_acta_sugerida).value = f"ERROR: {error_sug}"
+                        self.log(f"  -> No se pudo determinar Acta Vial sugerida: {error_sug}")
+                    elif sugerida:
+                        ws.cell(fila, col_acta_sugerida).value = sugerida
+                        self.log(f"  -> ACTA VIAL SUGERIDA: {sugerida} (dominio consultado: {dominio_usado})")
+                    else:
+                        ws.cell(fila, col_acta_sugerida).value = "NO SE ENCONTRO ACTA VIAL ASOCIADA"
+                        self.log("  -> No se encontró Acta Vial L/X/R/F asociada al dominio")
+                    # Esta regla sólo genera la sugerencia. No transforma la fila en VERIFICADA.
+                    wb.save(salida)
+                    continue
+
                 # REGLA 1: CON DOMINIO REAL, el cruce DOMINIO -> ACTA es la prueba principal.
                 if dominio_real:
                     if not acta:
