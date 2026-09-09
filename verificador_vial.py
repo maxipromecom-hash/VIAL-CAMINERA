@@ -20,7 +20,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-VERSION = "25.0"
+VERSION = "26.0"
 
 # Modelo de Disposición Final embebido directamente en este archivo.
 # Esto evita depender de módulos o archivos auxiliares al compilar con PyInstaller --onefile.
@@ -4783,6 +4783,25 @@ def _digitos_acta_sin_prefijo(valor):
     return None
 
 
+def extraer_acta_equivalente_del_texto(texto, objetivo):
+    """Devuelve el acta L/X/R/F EXACTA visible en pantalla equivalente al objetivo.
+
+    Es importante cuando el Excel trae sólo números: no devuelve el candidato
+    probado, sino la letra que realmente mostró Vial Caminera.
+    """
+    if not texto or not objetivo:
+        return None
+    obj = acta_canonica(objetivo)
+    if not obj:
+        return None
+    # Captura actas visibles con prefijo L/X/R/F y tolera espacios/guiones OCR/UI.
+    for m in re.finditer(r"(?<![A-Z0-9])([LXRF])\s*[- ]?\s*(\d{6,12})(?!\d)", str(texto).upper()):
+        encontrada = m.group(1) + m.group(2)
+        if acta_canonica(encontrada) == obj:
+            return encontrada
+    return None
+
+
 def candidatos_acta_verificacion(acta, acta_original=None):
     """Genera los identificadores que deben probarse en el sistema.
 
@@ -6517,9 +6536,13 @@ class App:
             texto=self.driver.find_element(By.TAG_NAME,'body').text
             for a in candidatos:
                 if cuerpo_contiene_acta_equivalente(texto, a):
+                    # Guardar el acta REAL que aparece en el resultado (incluida su letra),
+                    # no simplemente el candidato que estábamos probando.
+                    acta_real = extraer_acta_equivalente_del_texto(texto, a) or a
                     if idx > 1:
                         self.log(f"  -> Coincidencia hallada usando dominio invertido: {dominio_prueba}")
-                    return True, None, a
+                    self.log(f"  -> Acta exacta visible en sistema: {acta_real}")
+                    return True, None, acta_real
         return False, None, None
 
     def consultar_dominio_primera_acta(self, dominio):
