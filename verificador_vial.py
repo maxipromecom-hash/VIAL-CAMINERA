@@ -20,7 +20,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-VERSION = "23.0"
+VERSION = "25.0"
 
 # Modelo de Disposición Final embebido directamente en este archivo.
 # Esto evita depender de módulos o archivos auxiliares al compilar con PyInstaller --onefile.
@@ -5915,6 +5915,25 @@ def asegurar_columna_acta_sugerida(ws, header_row):
     return c
 
 
+
+def asegurar_columna_acta_verificada(ws, header_row):
+    """Crea/recupera ACTA VIAL VERIFICADA para guardar el prefijo real L/X/R/F usado."""
+    for c in range(1, ws.max_column + 1):
+        h = _header(ws.cell(header_row, c).value)
+        if h in {"ACTA VIAL VERIFICADA", "ACTA VERIFICADA"}:
+            return c
+    c = ws.max_column + 1
+    ws.cell(header_row, c).value = "ACTA VIAL VERIFICADA"
+    try:
+        from copy import copy
+        src = ws.cell(header_row, max(1, c-1)); dst = ws.cell(header_row, c)
+        if src.has_style:
+            dst._style = copy(src._style); dst.font = copy(src.font); dst.fill = copy(src.fill)
+            dst.border = copy(src.border); dst.alignment = copy(src.alignment); dst.number_format = src.number_format
+    except Exception:
+        pass
+    return c
+
 def ruta_recurso(nombre):
     """Devuelve la ruta de un recurso tanto en .py como dentro del EXE de PyInstaller."""
     candidatos=[]
@@ -5985,9 +6004,11 @@ def detectar_columna_secuestro(ws, header_row):
             continue
         hc = re.sub(r"[^A-Z0-9]+", " " , h).strip()
         tokens = hc.split()
-        if "SECUESTRO" in tokens or hc == "SEC" or hc.startswith("SEC " ) or hc.endswith(" SEC"):
+        if "SECUESTRO" in tokens or hc in {"SEC", "SEC.", "N SEC", "NRO SEC", "NUMERO SEC"} or hc.startswith("SEC ") or hc.endswith(" SEC"):
             return c
-        if "INGRESO" in tokens and any(t in tokens for t in ("NUMERO", "NRO", "NO", "N")):
+        if "INGRESO" in tokens and (any(t in tokens for t in ("NUMERO", "NRO", "NO", "N")) or len(tokens) == 1):
+            return c
+        if hc in {"NUMERO DE INGRESO", "NRO DE INGRESO", "N DE INGRESO", "N° DE INGRESO", "INGRESO"}:
             return c
         if hc in {"NRO SEC", "NUMERO SEC", "NO SEC", "N SEC"}:
             return c
@@ -6101,16 +6122,19 @@ def _copiar_estilo_celda(origen, destino):
         pass
 
 
-def _preparar_hoja_disposicion(ws, nombre_hoja, subtitulo, juzgados, filas_datos):
-    """Limpia el modelo dejando títulos/encabezados y carga los datos finales."""
+def _preparar_hoja_disposicion(ws, nombre_hoja, subtitulo, juzgados, filas_verificadas, filas_diferencias):
+    """Carga una única Disposición Final.
+
+    Primero coloca los secuestros VERIFICADOS y, a continuación, los que tienen
+    DIFERENCIAS. La columna I informa la observación/diferencia detectada.
+    """
     ws.title = nombre_hoja[:31]
-    # Guardar estilo de la primera fila de datos del modelo antes de borrar.
+
+    # Guardar estilos del modelo antes de borrar las filas de ejemplo.
     estilos=[]
-    valores_modelo=[]
     for c in range(1, 9):
-        cel=ws.cell(4,c)
-        estilos.append(cel)
-        valores_modelo.append(cel.value)
+        estilos.append(ws.cell(4, c))
+    estilo_obs = ws.cell(4, 8)  # usar SUMARIO como base visual para OBSERVACIÓN
     altura_modelo = ws.row_dimensions[4].height
 
     if ws.max_row >= 4:
@@ -6122,11 +6146,6 @@ def _preparar_hoja_disposicion(ws, nombre_hoja, subtitulo, juzgados, filas_datos
     try:
         from copy import copy
         al=copy(ws["E1"].alignment); al.wrap_text=True; al.horizontal="center"; al.vertical="center"; ws["E1"].alignment=al
-    except Exception:
-        pass
-    try:
-        # Tamaño dinámico para títulos largos.
-        from copy import copy
         largo=len(ws["E1"].value or "")
         tam=11 if largo <= 90 else 9 if largo <= 150 else 8
         ft=copy(ws["E1"].font); ft.sz=tam; ft.bold=True; ws["E1"].font=ft
@@ -6137,28 +6156,47 @@ def _preparar_hoja_disposicion(ws, nombre_hoja, subtitulo, juzgados, filas_datos
     # Conservar el título territorial del modelo y agregar el tipo de listado.
     titulo_base = str(ws["E2"].value or "").strip()
     if subtitulo:
-        if titulo_base:
-            ws["E2"] = f"{titulo_base}    |    {subtitulo}"
-        else:
-            ws["E2"] = subtitulo
+        ws["E2"] = f"{titulo_base}    |    {subtitulo}" if titulo_base else subtitulo
     try:
         from copy import copy
         al=copy(ws["E2"].alignment); al.wrap_text=True; al.horizontal="center"; al.vertical="center"; ws["E2"].alignment=al
     except Exception:
         pass
 
-    # La primera columna del modelo corresponde al NRO DE SECUESTRO real,
-    # no a una enumeración correlativa generada por el programa.
-    ws["A3"] = "NRO SECUESTRO"
-    for idx, datos in enumerate(filas_datos, start=1):
+    # Encabezados finales.
+    ws["A3"] = "NRO"
+    ws["B3"] = "INTERNO / SECUESTRO"
+    ws["I3"] = "OBSERVACIÓN"
+    try:
+        _copiar_estilo_celda(ws["H3"], ws["I3"])
+        ws.column_dimensions["I"].width = max(28, ws.column_dimensions["H"].width or 12)
+    except Exception:
+        pass
+
+    # Verificados arriba, diferencias debajo.
+    filas_todas=[]
+    for datos in filas_verificadas:
+        filas_todas.append((datos, ""))
+    for datos, observacion in filas_diferencias:
+        filas_todas.append((datos, observacion))
+
+    for idx, (datos, observacion) in enumerate(filas_todas, start=1):
         r = idx + 3
-        fila_val=list(datos)
+        fila_val=[idx] + list(datos) + [observacion or ""]
         for c, val in enumerate(fila_val, start=1):
             dst=ws.cell(r,c)
             dst.value=val
-            _copiar_estilo_celda(estilos[c-1], dst)
-            if c == 1:
-                # El NRO SECUESTRO es identificador, no cantidad: conservar /AA como texto.
+            if c <= 8:
+                _copiar_estilo_celda(estilos[c-1], dst)
+            else:
+                _copiar_estilo_celda(estilo_obs, dst)
+                try:
+                    from copy import copy
+                    al=copy(dst.alignment); al.wrap_text=True; dst.alignment=al
+                except Exception:
+                    pass
+            if c == 2:
+                # El secuestro/ingreso es identificador; conservar /AA como texto.
                 dst.number_format = "@"
         if altura_modelo:
             ws.row_dimensions[r].height = altura_modelo
@@ -6166,16 +6204,17 @@ def _preparar_hoja_disposicion(ws, nombre_hoja, subtitulo, juzgados, filas_datos
     # Repetir encabezados al imprimir y ajustar área.
     try:
         ws.print_title_rows = '1:3'
-        ws.print_area = f'A1:H{max(3, len(filas_datos)+3)}'
+        ws.print_area = f'A1:I{max(3, len(filas_todas)+3)}'
     except Exception:
         pass
 
 
 def generar_disposicion_final_desde_archivo(ruta_origen, ruta_salida=None):
-    """Genera un Excel de Disposición Final con VERIFICADOS y CON DIFERENCIAS.
+    """Genera una Disposición Final única.
 
-    Usa el modelo oficial suministrado por el usuario y muestra en E1, al lado de
-    PRO.ME.COM, los juzgados que efectivamente aparecen en cada listado.
+    Los VERIFICADOS salen primero. Inmediatamente debajo salen los SECUESTROS CON
+    DIFERENCIAS y la columna OBSERVACIÓN conserva el motivo exacto detectado por
+    el verificador (por ejemplo: DIFERENCIAS: COLOR / MARCA-MODELO / DOMINIO).
     """
     if not ruta_origen or not os.path.exists(ruta_origen):
         raise RuntimeError("No se encontró el Excel verificado para generar la Disposición Final.")
@@ -6188,13 +6227,15 @@ def generar_disposicion_final_desde_archivo(ruta_origen, ruta_salida=None):
     col_secuestro = detectar_columna_secuestro(ws_src, h)
     col_anio_secuestro = detectar_columna_anio_secuestro(ws_src, h)
     col_interno = buscar_columna_por_encabezado(ws_src, h, [
-        ("INTERNO",), ("REGISTRO",), ("NRO", "REG"), ("N°", "REG")
+        ("INTERNO",), ("REGISTRO", "INTERNO"), ("NRO", "INTERNO"), ("NUMERO", "INTERNO"),
+        ("NRO", "REG"), ("N°", "REG")
     ])
     col_motor = buscar_columna_por_encabezado(ws_src, h, [("MOTOR",)])
     col_acta_sug = buscar_columna_por_encabezado(ws_src, h, [("ACTA", "VIAL", "SUGERIDA"), ("ACTA", "VIAL", "DETECTADA")])
+    col_acta_ver = buscar_columna_por_encabezado(ws_src, h, [("ACTA", "VIAL", "VERIFICADA"), ("ACTA", "VERIFICADA")])
 
     verificadas=[]
-    diferencias=[]
+    diferencias=[]  # [(datos, observacion), ...]
     filas_ver=[]
     filas_dif=[]
 
@@ -6212,32 +6253,59 @@ def generar_disposicion_final_desde_archivo(ruta_origen, ruta_salida=None):
         anio_sec = ws_src.cell(fila, col_anio_secuestro).value if col_anio_secuestro else None
         secuestro = normalizar_numero_secuestro(secuestro_raw, anio_sec)
         interno = ws_src.cell(fila, col_interno).value if col_interno else ""
+        interno_final = secuestro or interno or ""
         tipo = ws_src.cell(fila, cfg["tipo"]).value if cfg.get("tipo") else ""
         marca = ws_src.cell(fila, cfg["marca_modelo"]).value if cfg.get("marca_modelo") else ""
         dominio = ws_src.cell(fila, cfg["dominio"]).value if cfg.get("dominio") else ""
         color = ws_src.cell(fila, cfg["color"]).value if cfg.get("color") else ""
         motor = ws_src.cell(fila, col_motor).value if col_motor else ""
-        sumario = ws_src.cell(fila, cfg["acta"]).value if cfg.get("acta") else ""
+
+        # SUMARIO: priorizar el acta exacta L/X/R/F con la que se verificó.
+        sumario = ""
+        if col_acta_ver:
+            av = ws_src.cell(fila, col_acta_ver).value
+            if av and es_acta_vial(av):
+                sumario = compact(av)
+        if not sumario:
+            sumario = ws_src.cell(fila, cfg["acta"]).value if cfg.get("acta") else ""
         if (sumario is None or not str(sumario).strip()) and col_acta_sug:
             sug=ws_src.cell(fila, col_acta_sug).value
             if sug and not str(sug).upper().startswith("ERROR") and "NO SE ENCONTRO" not in norm(sug):
                 sumario=sug
-        datos=[secuestro or "", interno or "", tipo or "", marca or "", dominio or "", color or "", motor or "", sumario or ""]
+
+        datos=[interno_final, tipo or "", marca or "", dominio or "", color or "", motor or "", sumario or ""]
         if es_ver:
             verificadas.append(datos); filas_ver.append(fila)
         else:
-            diferencias.append(datos); filas_dif.append(fila)
+            # Conservar exactamente la diferencia que ya dejó el proceso de verificación.
+            observacion = estado or "CON DIFERENCIAS"
+            diferencias.append((datos, observacion)); filas_dif.append(fila)
 
     modelo = obtener_modelo_resolucion_final()
     wb_out = load_workbook(modelo)
     base = wb_out[wb_out.sheetnames[0]]
-    hoja_dif = wb_out.copy_worksheet(base)
 
+    # Dejar una sola hoja principal para que las diferencias queden debajo de los verificados.
+    for nombre in list(wb_out.sheetnames[1:]):
+        try:
+            del wb_out[nombre]
+        except Exception:
+            pass
+
+    # Los juzgados del título corresponden a todos los vehículos incluidos en la disposición.
+    filas_todas = filas_ver + filas_dif
+    j_todos = juzgados_presentes(ws_src, filas_todas, h, cfg)
     j_ver = juzgados_presentes(ws_src, filas_ver, h, cfg)
     j_dif = juzgados_presentes(ws_src, filas_dif, h, cfg)
 
-    _preparar_hoja_disposicion(base, "VERIFICADOS", "VEHÍCULOS VERIFICADOS", j_ver, verificadas)
-    _preparar_hoja_disposicion(hoja_dif, "CON DIFERENCIAS", "VEHÍCULOS CON DIFERENCIAS", j_dif, diferencias)
+    _preparar_hoja_disposicion(
+        base,
+        "DISPOSICION FINAL",
+        "VEHÍCULOS VERIFICADOS Y SECUESTROS CON DIFERENCIAS",
+        j_todos,
+        verificadas,
+        diferencias,
+    )
 
     if ruta_salida is None:
         carpeta,nombre=os.path.split(ruta_origen)
@@ -6264,7 +6332,7 @@ class App:
 
     def _ui(self):
         tk.Label(self.root, text="VERIFICADOR VIAL CAMINERA", font=("Segoe UI", 18, "bold")).pack(pady=(15, 3))
-        tk.Label(self.root, text=f"Versión {VERSION} UNIVERSAL · Actas L/X/R/F · dominio normal/invertido · Disposición Final · secuestro con año · modelo embebido.", font=("Segoe UI", 10)).pack(pady=(0, 4))
+        tk.Label(self.root, text=f"Versión {VERSION} UNIVERSAL · Actas L/X/R/F · dominio normal/invertido · Disposición Final única · diferencias con observación · modelo embebido.", font=("Segoe UI", 10)).pack(pady=(0, 4))
         tk.Label(self.root, text="No guarda usuario ni contraseña. La sesión se inicia manualmente en Chrome.", font=("Segoe UI", 9)).pack(pady=(0, 12))
 
         f = tk.Frame(self.root)
@@ -6511,6 +6579,7 @@ class App:
             return
         ws=cfg["sheet"]
         col_acta_sugerida = asegurar_columna_acta_sugerida(ws, cfg["header_row"])
+        col_acta_verificada = asegurar_columna_acta_verificada(ws, cfg["header_row"])
         total=verificados=diferencias=no_encontrados=errores=0
 
         def colname(n):
@@ -6595,9 +6664,11 @@ class App:
                         errores+=1
                         self.log(f"  -> {cruce_error}")
                     elif cruce_ok:
+                        acta_confirmada = acta_match or acta
                         ws.cell(fila,cfg["verificacion"]).value="VERIFICADO POR DOMINIO"
+                        ws.cell(fila,col_acta_verificada).value=acta_confirmada
                         verificados+=1
-                        self.log(f"  -> VERIFICADO POR DOMINIO ({dominio_real} ↔ {acta_match or acta})")
+                        self.log(f"  -> VERIFICADO POR DOMINIO ({dominio_real} ↔ {acta_confirmada})")
                     else:
                         ws.cell(fila,cfg["verificacion"]).value="NO COINCIDE: DOMINIO NO ASOCIA ACTA"
                         diferencias+=1
@@ -6644,6 +6715,8 @@ class App:
                     wb.save(salida)
                     continue
 
+                # Guardar el acta exacta con el prefijo que realmente respondió el sistema.
+                ws.cell(fila,col_acta_verificada).value=acta_usada
                 marca_web=combinar_marca_modelo(datos or {})
                 color_web=(datos or {}).get("Color","")
                 self.log(f"  Información de Objeto: Marca/Modelo={marca_web} | Color={color_web}")
